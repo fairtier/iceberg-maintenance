@@ -23,7 +23,10 @@ Deliberately NOT handled here:
   - tables with delete files (DuckFlight/DuckDB writes are merge-on-read) —
     a COW rewrite through PyIceberg's scan would need delete-file semantics
     PyIceberg only partially applies, so those tables are skipped loudly
-    (snapshot expiry still runs — it never touches data files).
+    (snapshot expiry still runs — it never touches data files);
+  - tables whose manifests PyIceberg cannot decode faithfully (DuckDB's
+    Iceberg writer) — skipped loudly for the same reason, see
+    unrewritable_manifest_reason.
 
 The full design lives in docs/plans/iceberg-maintenance.md in the FairTier
 platform repo.
@@ -55,6 +58,7 @@ from pyiceberg.io.pyarrow import (
     _dataframe_to_data_files,
     schema_to_pyarrow,
 )
+from pyiceberg.manifest import ManifestContent, ManifestEntryStatus
 
 from .config import MIB, Config, load_config
 
@@ -160,6 +164,48 @@ def stream_batches(scan, tasks):
     yield from reader
 
 
+def unrewritable_manifest_reason(table, snapshot) -> str | None:
+    """Why the commit phase would reject this table's manifests, or None.
+
+    The atomic swap rewrites every live manifest entry as DELETED/EXISTING, and
+    `ManifestWriterV2.prepare_entry` refuses any such entry with a null
+    sequence number ("Only entries with status ADDED can have null sequence
+    number"). Some manifests can't satisfy that, because PyIceberg does not
+    decode them faithfully in the first place: on tables written by DuckDB's
+    Iceberg writer (the dbt/DuckFlight path — `<uuidv7>.parquet` data files, an
+    Avro schema that spells types as `{"type":"int"}` / `["null",{"type":
+    "long"}]` rather than `"int"` / `["null","long"]`), the entry header comes
+    back shifted: `status` holds the snapshot id, `snapshot_id` and
+    `sequence_number` are None. The `data_file` half still decodes correctly,
+    which is why reads and the scan are fine and only the rewrite trips.
+
+    Checking up front is what makes the failure cheap. Discovered at commit
+    time — as it was on 2026-07-31 — the job has already streamed the entire
+    table into fresh parquet, so a table it can never compact costs a full
+    rewrite of orphan files in object storage every single night.
+
+    Skipping is the conservative answer, not a workaround: entries we cannot
+    read faithfully are entries we must not rewrite. Snapshot expiry still runs
+    (it commits through the catalog and never touches manifests). The interop
+    bug itself belongs upstream.
+    """
+    for manifest in snapshot.manifests(io=table.io):
+        if manifest.content != ManifestContent.DATA:
+            continue
+        for entry in manifest.fetch_manifest_entry(io=table.io, discard_deleted=True):
+            if not isinstance(entry.status, ManifestEntryStatus):
+                return (
+                    f"manifest entry status is {entry.status!r}, not a status — "
+                    f"PyIceberg cannot decode {manifest.manifest_path.rsplit('/', 1)[-1]}"
+                )
+            if entry.sequence_number is None:
+                return (
+                    "manifest entry has no sequence number "
+                    f"({manifest.manifest_path.rsplit('/', 1)[-1]})"
+                )
+    return None
+
+
 def compact_table(table, s3_io, cfg: Config) -> str:
     """Compact one table if it needs it; returns a human-readable outcome."""
     snapshot = table.current_snapshot()
@@ -201,6 +247,14 @@ def compact_table(table, s3_io, cfg: Config) -> str:
             f"skipped: {small} small files are only {fraction:.0%} of {total / MIB:.1f} MiB "
             f"(< {cfg.rewrite_min_small_fraction:.0%}) — not worth a whole-table rewrite; "
             "waiting on per-file bin-packing"
+        )
+
+    # Last gate, and the only one that costs a manifest read — so it runs after
+    # the free ones: can the swap this is about to work for even commit?
+    if reason := unrewritable_manifest_reason(table, snapshot):
+        return (
+            f"SKIPPED: {reason} — written by another engine, so a rewrite would "
+            "fail at commit; snapshot expiry still runs"
         )
 
     # Streamed, atomic rewrite — peak memory is O(1) in table size (bounded by

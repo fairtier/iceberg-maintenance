@@ -1,8 +1,10 @@
 """Compaction tests against a real (local, on-disk) Iceberg warehouse.
 
-These exercise the two properties that have actually broken in production:
-the rewrite must produce the same rows in fewer files, and it must read the
-scan lazily (one data file at a time) instead of buffering the table.
+These exercise the properties that have actually broken in production: the
+rewrite must produce the same rows in fewer files, it must read the scan
+lazily (one data file at a time) instead of buffering the table, and a table
+whose manifests can't be rewritten must be skipped before anything is written
+rather than after a full rewrite.
 """
 
 import dataclasses
@@ -12,7 +14,11 @@ import pytest
 from pyiceberg.catalog.memory import InMemoryCatalog
 
 from iceberg_maintenance.config import MIB, Config
-from iceberg_maintenance.maintenance import compact_table, stream_batches
+from iceberg_maintenance.maintenance import (
+    compact_table,
+    stream_batches,
+    unrewritable_manifest_reason,
+)
 
 _FILES = 12
 _ROWS_PER_FILE = 500
@@ -150,3 +156,43 @@ def test_stream_batches_reads_one_file_at_a_time(table, monkeypatch):
     rows = first.num_rows + sum(batch.num_rows for batch in batches)
     assert rows == _FILES * _ROWS_PER_FILE
     assert opened == [task.file.file_path for task in tasks]
+
+
+def test_unrewritable_manifest_is_skipped_before_anything_is_written(
+    table, monkeypatch
+):
+    """A manifest PyIceberg can't decode must cost nothing, not a full rewrite.
+
+    Tables written by DuckDB's Iceberg writer come back with the entry header
+    shifted (`status` holding the snapshot id, `sequence_number` None), so the
+    swap's delete manifest is rejected at commit — after the whole table has
+    already been streamed into fresh parquet. Simulated here by mangling the
+    decoded entries the same way.
+    """
+    from pyiceberg.manifest import ManifestFile
+
+    original = ManifestFile.fetch_manifest_entry
+
+    def shifted(self, io, discard_deleted=True):
+        entries = original(self, io, discard_deleted)
+        for entry in entries:
+            # setattr, not attribute syntax: these assignments are deliberately
+            # ill-typed — that is the whole point of the fixture (PyIceberg
+            # hands back a `status` that is not a status).
+            setattr(entry, "status", 7366955187931005335)  # noqa: B010 — a snapshot id
+            setattr(entry, "snapshot_id", None)  # noqa: B010
+            setattr(entry, "sequence_number", None)  # noqa: B010
+        return entries
+
+    monkeypatch.setattr(ManifestFile, "fetch_manifest_entry", shifted)
+
+    before = _data_files(table)
+    outcome = compact_table(table, table.io, _cfg())
+
+    assert outcome.startswith("SKIPPED: manifest entry status is"), outcome
+    table.refresh()
+    assert _data_files(table) == before
+
+
+def test_healthy_manifests_are_not_reported_unrewritable(table):
+    assert unrewritable_manifest_reason(table, table.current_snapshot()) is None

@@ -54,6 +54,15 @@ corrupted data).
 - **Tables with delete files** (DuckFlight/DuckDB merge-on-read writes) — a
   copy-on-write rewrite isn't safe for them, so compaction skips them loudly.
   Snapshot expiry still runs (it never touches data files).
+- **Tables whose manifests PyIceberg can't decode** — on tables written by
+  DuckDB's Iceberg writer, PyIceberg reads the manifest *entry header* wrong:
+  `status` comes back holding the snapshot id and `sequence_number` is `None`
+  (the `data_file` half decodes fine, so reads and scans are unaffected).
+  Rewriting entries we can't read faithfully would be reckless, and the commit
+  rejects them anyway (`Only entries with status ADDED can have null sequence
+  number`), so compaction skips those tables — checked **before** any parquet
+  is written, since discovering it at commit time means a whole table rewritten
+  into orphan files for nothing. Snapshot expiry still runs.
 
 ## Usage
 
@@ -146,7 +155,7 @@ Images are published to `ghcr.io/fairtier/iceberg-maintenance` by the
 (multi-arch: linux/amd64 + linux/arm64):
 
 ```bash
-git tag v0.2.0 && git push origin v0.2.0
+git tag v0.3.0 && git push origin v0.3.0
 ```
 
 Then bump the image tag in the box chart

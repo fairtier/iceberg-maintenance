@@ -72,8 +72,13 @@ tests/              # pytest suite
 - **Atomic swap.** The old-files delete and new-files append commit in a single
   transaction; a crash before commit leaves the table completely untouched
   (only orphan parquet in storage, which the orphan-sweep follow-up handles).
-- **Safe skips.** Tables with delete files (merge-on-read) are skipped for
-  compaction but still get (metadata-only) snapshot expiry.
+- **Safe skips, checked before any write.** Tables with delete files
+  (merge-on-read) and tables whose manifest entries PyIceberg mis-decodes
+  (DuckDB's Iceberg writer — `status` holds the snapshot id, `sequence_number`
+  is null, so the swap's delete manifest is rejected at commit) are skipped for
+  compaction but still get (metadata-only) snapshot expiry. Both gates run
+  *before* the rewrite: a skip discovered at commit time costs a full
+  table rewrite into orphan parquet, every night, forever.
 - **Direct S3 IO.** `table.io` is replaced with a direct-credential
   `PyArrowFileIO` after `load_table()` to sidestep Lakekeeper's forced
   `S3V4RestSigner` (a known PyIceberg async-s3fs bug).
