@@ -1,0 +1,144 @@
+# iceberg-maintenance
+
+[![CI](https://github.com/fairtier/iceberg-maintenance/actions/workflows/ci.yml/badge.svg)](https://github.com/fairtier/iceberg-maintenance/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/fairtier/iceberg-maintenance)](LICENSE)
+
+Nightly [Apache Iceberg](https://iceberg.apache.org/) table maintenance for a
+[FairTier](https://fairtier.com) box warehouse: **small-file compaction** plus
+**snapshot expiry**, run as a Kubernetes CronJob against the on-box
+[Lakekeeper](https://lakekeeper.io/) catalog.
+
+This is the baked-image form of what used to be a `pip install pyiceberg` at
+job start inside the box chart. The per-run install was the single biggest
+CPU/IO spike of the nightly job on a small (2‑vCPU) box; shipping a prebuilt
+`ghcr.io/fairtier/iceberg-maintenance` image removes it. The Helm chart that
+schedules it lives in the FairTier monorepo at
+`apps/box/iceberg-maintenance/`, and the full design is in
+`docs/plans/iceberg-maintenance.md` there.
+
+## What it does
+
+For every table in the warehouse:
+
+1. **Compaction** — when a table has accumulated at least `MIN_INPUT_FILES`
+   small (`< SMALL_FILE_MAX_BYTES`) data files *and* those small files are a
+   meaningful share of the table (`≥ REWRITE_MIN_SMALL_FRACTION` by bytes), the
+   table is rewritten. The rewrite **streams** a lazy `RecordBatchReader`
+   through a chunked read → write (`REWRITE_CHUNK_BYTES` per flush), so peak
+   memory is **O(1) in table size** — there is no size cap, and the job cannot
+   OOM on a large table. The swap (drop every old data file, add the new ones)
+   is a single atomic Iceberg transaction.
+2. **Snapshot expiry** — snapshots older than `MAX_SNAPSHOT_AGE_MS` (the
+   customer-visible time-travel window) are expired, keeping the newest
+   `MIN_SNAPSHOTS_TO_KEEP` regardless of age and never touching branch heads or
+   tags. This is metadata-only.
+
+Compaction and expiry are each per-table and independent; a failure or skip on
+one table never blocks the others, and a commit lost to a concurrent dlt load
+is logged and retried next run (Iceberg optimistic concurrency — never
+corrupted data).
+
+### Deliberately not handled
+
+- **Orphan-file removal** — no OSS option exists (Lakekeeper's queue is
+  Enterprise-only; PyIceberg's implementation never merged). Snapshot expiry
+  above trims *metadata* only; the unreferenced data files stay in object
+  storage until an orphan sweep exists. This is a tracked open gap.
+- **Tables with delete files** (DuckFlight/DuckDB merge-on-read writes) — a
+  copy-on-write rewrite isn't safe for them, so compaction skips them loudly.
+  Snapshot expiry still runs (it never touches data files).
+
+## Usage
+
+```bash
+docker run --rm \
+  -e CATALOG_URI=http://lakekeeper:8181/catalog \
+  -e WAREHOUSE=default \
+  -e OIDC_CLIENT_ID=... \
+  -e OIDC_CLIENT_SECRET=... \
+  -e OIDC_TOKEN_URL=https://auth.example/api/login/oauth/access_token \
+  -e AWS_ENDPOINT_URL=https://s3.example \
+  -e AWS_ACCESS_KEY_ID=... \
+  -e AWS_SECRET_ACCESS_KEY=... \
+  -e AWS_REGION=auto \
+  ghcr.io/fairtier/iceberg-maintenance:latest
+```
+
+Exit code is `0` when every table was processed cleanly, `1` if any table hit a
+non-transient error (compaction/expiry commit conflicts are transient and do
+not fail the run).
+
+## Configuration
+
+All configuration is via environment variables (injected by the box Helm
+chart). Defaults mirror that chart's `values.yaml`.
+
+### Required
+
+| Variable              | Description                                                            |
+|-----------------------|------------------------------------------------------------------------|
+| `CATALOG_URI`         | Lakekeeper Iceberg REST catalog URL (e.g. `http://lakekeeper:8181/catalog`) |
+| `WAREHOUSE`           | Lakekeeper warehouse to maintain                                       |
+| `OIDC_CLIENT_ID`      | OAuth2 client id — a Lakekeeper warehouse **writer** principal         |
+| `OIDC_CLIENT_SECRET`  | OAuth2 client secret                                                   |
+| `OIDC_TOKEN_URL`      | OAuth2 token endpoint (Casdoor)                                        |
+| `AWS_ENDPOINT_URL`    | S3-compatible endpoint for **direct** data-file IO (bypasses the catalog's forced signer — see below) |
+| `AWS_ACCESS_KEY_ID`   | Storage access key                                                     |
+| `AWS_SECRET_ACCESS_KEY` | Storage secret key                                                   |
+
+### Optional
+
+| Variable                     | Default        | Description                                                                 |
+|------------------------------|----------------|-----------------------------------------------------------------------------|
+| `AWS_REGION`                 | `auto`         | S3 region (`auto` for Cloudflare R2)                                        |
+| `SMALL_FILE_MAX_BYTES`       | `33554432`     | A data file below this counts as "small"                                   |
+| `MIN_INPUT_FILES`            | `8`            | Compact only when a table has at least this many small files               |
+| `REWRITE_MIN_SMALL_FRACTION` | `0.3`          | Write-amplification gate: rewrite only when small files are ≥ this fraction of the table by bytes |
+| `REWRITE_CHUNK_BYTES`        | `134217728`    | Streaming chunk size — the **only** thing that sets peak rewrite memory (constant in table size), and the approximate output data-file size |
+| `MAX_SNAPSHOT_AGE_MS`        | `604800000`    | Time-travel window; snapshots older than this are expired (7 days)         |
+| `MIN_SNAPSHOTS_TO_KEEP`      | `5`            | Retention floor: always keep the newest N snapshots regardless of age      |
+
+### Why direct S3 credentials?
+
+Lakekeeper force-overrides clients to `FsspecFileIO` + `S3V4RestSigner`, and
+PyIceberg's `S3V4RestSigner` event handler never fires under async s3fs (a
+known PyIceberg bug). So after `load_table()` the job replaces `table.io` with
+a direct-credential `PyArrowFileIO` built from the `AWS_*` variables — the same
+workaround dlt-worker uses via AWS env vars.
+
+## Pinned PyIceberg
+
+`pyiceberg` is pinned **exactly** to `0.11.1` (not a floor). The compaction
+rewrite drives a PyIceberg-internal helper (`_dataframe_to_data_files`) to
+stream a `RecordBatchReader` in chunks, because the released 0.11.1 public API
+still rejects a reader (`ValueError("Expected PyArrow table")`). Depending on
+an internal is safe *only* while the version is frozen. When a PyIceberg
+release ships `Table.overwrite`/`append` accepting a `RecordBatchReader`, the
+whole hand-rolled block collapses to
+`table.overwrite(table.scan().to_arrow_batch_reader())` and the private import
+goes away — see the `AWAITING-UPSTREAM` note in
+[`maintenance.py`](src/iceberg_maintenance/maintenance.py).
+
+## Development
+
+```bash
+uv sync                        # install deps + dev tools
+uv run ruff check .            # lint
+uv run ruff format --check .   # format check
+uv run ty check                # type check
+uv run pytest -v               # tests
+uv run python -m iceberg_maintenance   # run (needs the env vars above)
+```
+
+## Releasing
+
+Images are published to `ghcr.io/fairtier/iceberg-maintenance` by the
+[release workflow](.github/workflows/release.yml) on any `v*` tag
+(multi-arch: linux/amd64 + linux/arm64):
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+Then bump the image tag in the box chart
+(`apps/box/iceberg-maintenance/values.yaml`) via GitOps.
