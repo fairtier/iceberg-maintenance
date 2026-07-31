@@ -23,11 +23,18 @@ For every table in the warehouse:
 1. **Compaction** — when a table has accumulated at least `MIN_INPUT_FILES`
    small (`< SMALL_FILE_MAX_BYTES`) data files *and* those small files are a
    meaningful share of the table (`≥ REWRITE_MIN_SMALL_FRACTION` by bytes), the
-   table is rewritten. The rewrite **streams** a lazy `RecordBatchReader`
-   through a chunked read → write (`REWRITE_CHUNK_BYTES` per flush), so peak
-   memory is **O(1) in table size** — there is no size cap, and the job cannot
-   OOM on a large table. The swap (drop every old data file, add the new ones)
-   is a single atomic Iceberg transaction.
+   table is rewritten. The rewrite **streams** the scan (`stream_batches`, one
+   data file open at a time) through a chunked read → write
+   (`REWRITE_CHUNK_BYTES` per flush), so peak memory is **O(1) in table size** —
+   there is no size cap, and the job cannot OOM on a large table. The swap (drop
+   every old data file, add the new ones) is a single atomic Iceberg
+   transaction.
+
+   > PyIceberg's own `scan.to_arrow_batch_reader()` is *not* lazy despite the
+   > name: it `executor.map`s every data file up front and holds each finished
+   > file's batches until the consumer catches up, i.e. O(table size). Using it
+   > OOM-killed the nightly job on a 1Gi box (0.1.0); `stream_batches` drives
+   > the sequential path instead, and a test pins the invariant.
 2. **Snapshot expiry** — snapshots older than `MAX_SNAPSHOT_AGE_MS` (the
    customer-visible time-travel window) are expired, keeping the newest
    `MIN_SNAPSHOTS_TO_KEEP` regardless of age and never touching branch heads or
@@ -109,14 +116,16 @@ workaround dlt-worker uses via AWS env vars.
 ## Pinned PyIceberg
 
 `pyiceberg` is pinned **exactly** to `0.11.1` (not a floor). The compaction
-rewrite drives a PyIceberg-internal helper (`_dataframe_to_data_files`) to
-stream a `RecordBatchReader` in chunks, because the released 0.11.1 public API
-still rejects a reader (`ValueError("Expected PyArrow table")`). Depending on
-an internal is safe *only* while the version is frozen. When a PyIceberg
-release ships `Table.overwrite`/`append` accepting a `RecordBatchReader`, the
-whole hand-rolled block collapses to
-`table.overwrite(table.scan().to_arrow_batch_reader())` and the private import
-goes away — see the `AWAITING-UPSTREAM` note in
+rewrite drives two PyIceberg-internal helpers — `_dataframe_to_data_files` to
+write a chunk (the released 0.11.1 public API still rejects a reader:
+`ValueError("Expected PyArrow table")`) and `ArrowScan`'s sequential
+`_record_batches_from_scan_tasks_and_deletes` to *read* one file at a time.
+Depending on internals is safe *only* while the version is frozen. When a
+PyIceberg release ships `Table.overwrite`/`append` accepting a
+`RecordBatchReader`, the hand-rolled write block collapses to
+`table.overwrite(stream_batches(scan, tasks))` — note: still **not**
+`scan.to_arrow_batch_reader()`, which buffers whole files behind an executor.
+See the `AWAITING-UPSTREAM` note in
 [`maintenance.py`](src/iceberg_maintenance/maintenance.py).
 
 ## Development
@@ -137,7 +146,7 @@ Images are published to `ghcr.io/fairtier/iceberg-maintenance` by the
 (multi-arch: linux/amd64 + linux/arm64):
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.2.0 && git push origin v0.2.0
 ```
 
 Then bump the image tag in the box chart

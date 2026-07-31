@@ -2,9 +2,10 @@
 
 Walks every table in the warehouse and
   1. where a table has accumulated enough small data files, rewrites it by
-     streaming a lazy RecordBatchReader straight into fresh data files — no
-     whole-table materialization, so peak memory is O(1) in table size and
-     there is no size cap (scan().to_arrow_batch_reader() -> chunked write);
+     streaming the scan straight into fresh data files — no whole-table
+     materialization, so peak memory is O(1) in table size and there is no
+     size cap (stream_batches -> chunked write; note that PyIceberg's own
+     scan().to_arrow_batch_reader() is NOT lazy — see stream_batches);
   2. expires snapshots past the time-travel window (metadata-only: branch
      heads and tags are never expired, and a retention floor of the newest
      snapshots is kept).
@@ -39,14 +40,21 @@ from pyiceberg.catalog import load_catalog
 from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.expressions import AlwaysTrue
 
-# NOTE: `_dataframe_to_data_files` is a PyIceberg-internal (underscore) helper.
-# Depending on it is deliberate and safe *because the version is pinned*
-# (pyproject.toml pins pyiceberg==0.11.1) — internals can't shift under a
-# frozen pin. It is the same function `Table.overwrite` calls; we drive it
-# directly only to feed it a streamed reader in chunks instead of one
-# materialized table, which the released 0.11.1 public API refuses (see
-# AWAITING-UPSTREAM in compact_table). Revisit on every pyiceberg bump.
-from pyiceberg.io.pyarrow import PyArrowFileIO, _dataframe_to_data_files
+# NOTE: `_dataframe_to_data_files` and `_record_batches_from_scan_tasks_and_deletes`
+# (used via ArrowScan in stream_batches) are PyIceberg-internal (underscore)
+# helpers. Depending on them is deliberate and safe *because the version is
+# pinned* (pyproject.toml pins pyiceberg==0.11.1) — internals can't shift under
+# a frozen pin. `_dataframe_to_data_files` is the same function
+# `Table.overwrite` calls; we drive it directly only to feed it a streamed
+# reader in chunks instead of one materialized table, which the released 0.11.1
+# public API refuses (see AWAITING-UPSTREAM in compact_table). Revisit on every
+# pyiceberg bump.
+from pyiceberg.io.pyarrow import (
+    ArrowScan,
+    PyArrowFileIO,
+    _dataframe_to_data_files,
+    schema_to_pyarrow,
+)
 
 from .config import MIB, Config, load_config
 
@@ -103,6 +111,55 @@ def all_namespaces(catalog):
     return out
 
 
+def stream_batches(scan, tasks):
+    """Yield the scan's record batches lazily — one data file, one batch at a time.
+
+    Deliberately NOT `scan.to_arrow_batch_reader()`. Despite the name (and its
+    docstring promising "less memory ... a RecordBatch is read one at a time"),
+    0.11.1's `ArrowScan.to_record_batches` does:
+
+        executor.map(lambda task: list(batches_of(task)), tasks)
+
+    `Executor.map` submits EVERY file up front, each worker materializes one
+    whole data file's batches into a list, and the results of finished futures
+    sit in memory until the consumer reaches them. Our consumer — parquet
+    encode + upload to object storage — is far slower than the readers, so
+    those buffered lists pile up toward the whole table: peak memory is O(table
+    size), not O(batch), and no chunk size can bound it. That is what
+    OOM-killed the nightly job on a box at its 1Gi limit on 2026-07-31 (RSS
+    pinned at the cap, node into swapless thrash, no log line naming the table
+    it died on).
+
+    Driving `_record_batches_from_scan_tasks_and_deletes` gives byte-identical
+    batches (same projection, same delete handling, same `.cast` to the
+    projected schema as `to_arrow_batch_reader` applies) from a plain
+    generator: one file open at a time, one batch in flight, and the reader
+    only advances when we ask for the next batch.
+
+    Passing `deletes_per_file={}` is correct, not a shortcut: `compact_table`
+    returns early for any table that has delete files, so there are none to
+    apply here.
+    """
+    arrow_scan = ArrowScan(
+        scan.table_metadata,
+        scan.io,
+        scan.projection(),
+        scan.row_filter,
+        scan.case_sensitive,
+        scan.limit,
+    )
+    batches = arrow_scan._record_batches_from_scan_tasks_and_deletes(tasks, {})
+    target_schema = schema_to_pyarrow(scan.projection())
+    # The cast is what makes batches read from files with different physical
+    # types (e.g. string vs large_string across dlt schema evolution) concat
+    # into one chunk — DataScan.to_arrow_batch_reader wraps its batches exactly
+    # the same way.
+    reader = pyarrow.RecordBatchReader.from_batches(target_schema, batches).cast(
+        target_schema
+    )
+    yield from reader
+
+
 def compact_table(table, s3_io, cfg: Config) -> str:
     """Compact one table if it needs it; returns a human-readable outcome."""
     snapshot = table.current_snapshot()
@@ -117,7 +174,10 @@ def compact_table(table, s3_io, cfg: Config) -> str:
 
     table.io = s3_io
 
-    tasks = list(table.scan().plan_files())
+    # One scan object for both the plan and the read below — planning twice
+    # would re-fetch the manifests for nothing.
+    scan = table.scan()
+    tasks = list(scan.plan_files())
     if any(task.delete_files for task in tasks):
         return "SKIPPED: has delete files (merge-on-read writes) — compaction not supported yet"
 
@@ -154,9 +214,13 @@ def compact_table(table, s3_io, cfg: Config) -> str:
     # but is UNRELEASED: the latest release, 0.11.1 (our pin), still raises
     # `ValueError("Expected PyArrow table")` on a reader. When a release ships
     # with it, delete this whole block and use that one call, dropping the
-    # private-API import. Until then we reproduce exactly what 0.11.1's own
-    # Transaction.overwrite does internally, but feed the reader in chunks
-    # instead of one materialized table.
+    # `_dataframe_to_data_files` import — but keep feeding it `stream_batches`,
+    # NOT `scan.to_arrow_batch_reader()`: the reader that method hands back
+    # buffers whole files behind an executor (see stream_batches), so the
+    # tidy-looking one-liner would quietly restore the OOM. Until then we
+    # reproduce exactly what 0.11.1's own Transaction.overwrite does
+    # internally, but feed the reader in chunks instead of one materialized
+    # table.
     #
     # Phase 1 (heavy; NO transaction open): stream the scan, accumulate batches
     # to ~cfg.rewrite_chunk_bytes, write each chunk to fresh parquet data files
@@ -188,8 +252,20 @@ def compact_table(table, s3_io, cfg: Config) -> str:
         )
         del chunk
         release_memory()
+        log.info("%s: %d data file(s) written", ".".join(table.name()), len(data_files))
 
-    for batch in table.scan().to_arrow_batch_reader():
+    # Progress, not decoration: the whole rewrite is one long silent stretch,
+    # and when the 2026-07-31 run was OOM-killed mid-table the log did not even
+    # say which table it had moved on to.
+    log.info(
+        "%s: rewriting %d files (%.1f MiB, %d small) in ~%d MiB chunks",
+        ".".join(table.name()),
+        len(sizes),
+        total / MIB,
+        small,
+        cfg.rewrite_chunk_bytes // MIB,
+    )
+    for batch in stream_batches(scan, tasks):
         pending.append(batch)
         pending_bytes += batch.nbytes
         if pending_bytes >= cfg.rewrite_chunk_bytes:

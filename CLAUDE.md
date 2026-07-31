@@ -58,11 +58,17 @@ tests/              # pytest suite
 
 ## Correctness invariants (do not regress)
 
-- **Streaming, not buffering.** Compaction rewrites a table by streaming a lazy
-  `RecordBatchReader` in `REWRITE_CHUNK_BYTES` chunks — peak memory is O(1) in
-  table size. Never reintroduce a whole-table `scan().to_arrow()` or a
-  "skip big tables" size cap; both were removed for causing box-wide stalls.
-  "OOM is a bug, not a small box."
+- **Streaming, not buffering.** Compaction rewrites a table by streaming the
+  scan through `stream_batches` in `REWRITE_CHUNK_BYTES` chunks — peak memory
+  is O(1) in table size. Never reintroduce a whole-table `scan().to_arrow()` or
+  a "skip big tables" size cap; both were removed for causing box-wide stalls.
+  **And never go back to `scan.to_arrow_batch_reader()`** — it looks like the
+  streaming API but `ArrowScan.to_record_batches` `executor.map`s every data
+  file up front and keeps each finished file's batches until the consumer gets
+  there, so a slow consumer (us: parquet + upload) buffers the whole table.
+  That OOM-killed the 1Gi nightly job on 2026-07-31; `stream_batches` and
+  `tests/test_compaction.py::test_stream_batches_reads_one_file_at_a_time`
+  exist to keep it out. "OOM is a bug, not a small box."
 - **Atomic swap.** The old-files delete and new-files append commit in a single
   transaction; a crash before commit leaves the table completely untouched
   (only orphan parquet in storage, which the orphan-sweep follow-up handles).
