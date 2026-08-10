@@ -19,6 +19,26 @@ def _require(name: str) -> str:
     return value
 
 
+def _otel_enabled() -> bool:
+    """Telemetry is on when — and only when — an OTLP endpoint is configured.
+
+    No bespoke toggle: the presence of a collector endpoint *is* the intent,
+    and the standard kill switch (`OTEL_SDK_DISABLED=true`) still wins. Absent
+    an endpoint the SDK would default to localhost:4318 and spend the end of
+    every run retrying an export into a closed port.
+    """
+    if os.environ.get("OTEL_SDK_DISABLED", "").strip().lower() == "true":
+        return False
+    return any(
+        os.environ.get(name)
+        for name in (
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        )
+    )
+
+
 @dataclass(frozen=True)
 class Config:
     # --- Catalog (Lakekeeper REST) + OAuth2 (Casdoor) ---
@@ -43,6 +63,13 @@ class Config:
     # --- Snapshot-expiry knobs (the customer-visible time-travel window) ---
     max_snapshot_age_ms: int
     min_snapshots_to_keep: int
+
+    # --- Observability (see telemetry.py) ---
+    # Everything else OpenTelemetry needs (endpoint, headers, service name,
+    # timeouts) is read straight from the standard OTEL_* variables by the SDK;
+    # this is only the on/off decision. Defaults off so the job runs unchanged
+    # on a box with no collector.
+    otel_enabled: bool = False
 
     @property
     def credential(self) -> str:
@@ -71,4 +98,5 @@ def load_config() -> Config:
             os.environ.get("MAX_SNAPSHOT_AGE_MS", str(7 * 24 * 3600 * 1000))
         ),
         min_snapshots_to_keep=int(os.environ.get("MIN_SNAPSHOTS_TO_KEEP", "5")),
+        otel_enabled=_otel_enabled(),
     )

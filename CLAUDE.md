@@ -45,8 +45,27 @@ src/iceberg_maintenance/
   __main__.py       # entry point (python -m iceberg_maintenance)
   config.py         # environment-variable configuration (Config dataclass)
   maintenance.py    # compaction + snapshot expiry logic and the main loop
-tests/              # pytest suite
+  telemetry.py      # OpenTelemetry setup + the instruments maintenance.py uses
+tests/              # pytest suite (conftest.py holds the local-warehouse fixture)
 ```
+
+## Observability
+
+Traces + metrics via OpenTelemetry, OTLP over **HTTP** (no grpcio in the
+image). Enabled only when `OTEL_EXPORTER_OTLP_ENDPOINT` (or a per-signal
+endpoint) is set — otherwise the OpenTelemetry API's no-op path, so a box with
+no collector runs unchanged. See the README's "Observability" section for the
+span tree and the metric list.
+
+Rules that keep it honest:
+
+- **Telemetry never fails the run.** Setup and shutdown swallow their own
+  exceptions; instrumentation calls sit on the API, not the SDK.
+- **Flush at exit.** `telemetry.setup()` returns a shutdown callable that
+  `main` calls in a `finally` — a CronJob exits long before batched spans or
+  periodic metrics would export on their own.
+- **Metrics stay low-cardinality; table names ride on spans only.** Outcomes
+  are the closed `Outcome.kind` vocabulary, not free text.
 
 ## CI/CD
 

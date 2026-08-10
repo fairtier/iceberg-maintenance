@@ -114,6 +114,61 @@ chart). Defaults mirror that chart's `values.yaml`.
 | `MAX_SNAPSHOT_AGE_MS`        | `604800000`    | Time-travel window; snapshots older than this are expired (7 days)         |
 | `MIN_SNAPSHOTS_TO_KEEP`      | `5`            | Retention floor: always keep the newest N snapshots regardless of age      |
 
+### Observability (OpenTelemetry)
+
+Off unless a collector is configured: set `OTEL_EXPORTER_OTLP_ENDPOINT` (OTLP
+over **HTTP**, so `http://collector:4318`) and the run exports traces and
+metrics; leave it unset and every instrumentation call goes through the
+OpenTelemetry API's no-op path, costing nothing. `OTEL_SDK_DISABLED=true` and
+the rest of the standard `OTEL_*` variables (`OTEL_SERVICE_NAME`,
+`OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_RESOURCE_ATTRIBUTES`, …) work as usual;
+`service.name` defaults to `iceberg-maintenance` and the warehouse rides along
+as the resource attribute `iceberg.warehouse`.
+
+A run is one trace:
+
+```
+iceberg.maintenance.run
+└── iceberg.maintenance.table                  iceberg.table, iceberg.namespace
+    ├── iceberg.catalog.load_table
+    ├── iceberg.compact                        iceberg.outcome + the input/small
+    │   ├── iceberg.compact.plan                 file counts every gate decided on
+    │   ├── iceberg.compact.check_manifests
+    │   ├── iceberg.compact.rewrite            one "chunk written" event per flush
+    │   └── iceberg.compact.commit               (rows, bytes, files so far)
+    └── iceberg.expire_snapshots               iceberg.outcome, snapshot counts
+```
+
+Catalog HTTP calls (Lakekeeper, the OAuth token endpoint) are traced too, via
+`opentelemetry-instrumentation-requests` — without them the trace is our spans
+separated by unexplained gaps. Data-file IO goes through PyArrow's C++ S3
+client and stays invisible.
+
+| Metric                                          | Type      | Attributes                      |
+|-------------------------------------------------|-----------|---------------------------------|
+| `iceberg.maintenance.run.duration`              | histogram | `iceberg.outcome` (`ok`/`errors`/`failed`) |
+| `iceberg.maintenance.tables.scanned`            | counter   | —                               |
+| `iceberg.maintenance.operations`                | counter   | `iceberg.operation`, `iceberg.outcome` |
+| `iceberg.maintenance.operation.duration`        | histogram | `iceberg.operation`, `iceberg.outcome` |
+| `iceberg.maintenance.compaction.files.rewritten`| counter   | —                               |
+| `iceberg.maintenance.compaction.files.written`  | counter   | —                               |
+| `iceberg.maintenance.compaction.bytes.rewritten`| counter   | —                               |
+| `iceberg.maintenance.snapshots.expired`         | counter   | —                               |
+
+`iceberg.outcome` is the headline label — `compacted`, `healthy`, `skipped`,
+`unsupported`, `empty`, `expired`, `nothing`, `conflict`, `failed` (see
+`Outcome` in `maintenance.py`). Alert on `failed`; a rising `conflict` means
+compaction keeps losing the commit race to concurrent dlt loads. Table names
+are deliberately **spans-only**, never metric attributes — the counters answer
+"did tonight go well", the trace answers "which table".
+
+Two things this job does because it is a CronJob and not a server: it
+force-flushes both pipelines at exit (a batch process dies long before batched
+spans or periodic metrics would export on their own), and it defaults
+`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` to `delta`, since a fresh
+process every night would otherwise make cumulative counters read as a nightly
+reset. Setting that variable explicitly still wins.
+
 ### Why direct S3 credentials?
 
 Lakekeeper force-overrides clients to `FsspecFileIO` + `S3V4RestSigner`, and

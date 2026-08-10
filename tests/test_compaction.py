@@ -5,75 +5,17 @@ rewrite must produce the same rows in fewer files, it must read the scan
 lazily (one data file at a time) instead of buffering the table, and a table
 whose manifests can't be rewritten must be skipped before anything is written
 rather than after a full rewrite.
+
+The warehouse fixture and the config factory live in conftest.py.
 """
 
-import dataclasses
+from conftest import FILES, ROWS_PER_FILE
 
-import pyarrow
-import pytest
-from pyiceberg.catalog.memory import InMemoryCatalog
-
-from iceberg_maintenance.config import MIB, Config
 from iceberg_maintenance.maintenance import (
     compact_table,
     stream_batches,
     unrewritable_manifest_reason,
 )
-
-_FILES = 12
-_ROWS_PER_FILE = 500
-
-
-# Connection fields are never dialled here (the tests run against a local
-# warehouse), so they are placeholders. The knobs are what matter: everything
-# counts as "small" and the whole table is small files, so the size/fraction
-# gates never stand between a test and the rewrite it wants to exercise.
-_BASE = Config(
-    catalog_uri="http://lakekeeper:8181/catalog",
-    warehouse="default",
-    oidc_client_id="client",
-    oidc_client_secret="secret",
-    oidc_token_url="https://auth.example/token",
-    aws_endpoint_url="https://s3.example",
-    aws_access_key_id="ak",
-    aws_secret_access_key="sk",
-    aws_region="auto",
-    small_file_max_bytes=32 * MIB,
-    min_input_files=4,
-    rewrite_min_small_fraction=0.0,
-    rewrite_chunk_bytes=32 * MIB,
-    max_snapshot_age_ms=7 * 24 * 3600 * 1000,
-    min_snapshots_to_keep=5,
-)
-
-
-def _cfg(**overrides) -> Config:
-    return dataclasses.replace(_BASE, **overrides)
-
-
-@pytest.fixture
-def table(tmp_path):
-    """A table of _FILES small data files, one per append."""
-    catalog = InMemoryCatalog("test", warehouse=str(tmp_path))
-    catalog.create_namespace("ns")
-    schema = pyarrow.schema(
-        [
-            pyarrow.field("id", pyarrow.int64(), nullable=False),
-            pyarrow.field("payload", pyarrow.string(), nullable=False),
-        ]
-    )
-    tbl = catalog.create_table("ns.small_files", schema=schema)
-    for f in range(_FILES):
-        tbl.append(
-            pyarrow.table(
-                {
-                    "id": list(range(f * _ROWS_PER_FILE, (f + 1) * _ROWS_PER_FILE)),
-                    "payload": [f"row-{f}"] * _ROWS_PER_FILE,
-                },
-                schema=schema,
-            )
-        )
-    return tbl
 
 
 def _data_files(tbl) -> list[str]:
@@ -92,34 +34,35 @@ def _rows(tbl) -> dict:
     return tbl.scan().to_arrow().sort_by("id").to_pydict()
 
 
-def test_compaction_preserves_rows_and_shrinks_file_count(table):
+def test_compaction_preserves_rows_and_shrinks_file_count(table, cfg):
     before = _rows(table)
     schema_before = table.schema()
-    assert len(_data_files(table)) == _FILES
+    assert len(_data_files(table)) == FILES
 
-    outcome = compact_table(table, table.io, _cfg())
+    outcome = compact_table(table, table.io, cfg())
 
-    assert outcome.startswith("compacted"), outcome
+    assert outcome.kind == "compacted", outcome
+    assert outcome.message.startswith("compacted"), outcome
     table.refresh()
-    assert len(_data_files(table)) < _FILES
+    assert len(_data_files(table)) < FILES
     assert _rows(table) == before
     assert table.schema() == schema_before
 
 
-def test_compaction_is_a_no_op_below_the_small_file_threshold(table):
-    outcome = compact_table(table, table.io, _cfg(min_input_files=_FILES + 1))
+def test_compaction_is_a_no_op_below_the_small_file_threshold(table, cfg):
+    outcome = compact_table(table, table.io, cfg(min_input_files=FILES + 1))
 
-    assert outcome.startswith("healthy"), outcome
-    assert len(_data_files(table)) == _FILES
+    assert outcome.kind == "healthy", outcome
+    assert len(_data_files(table)) == FILES
 
 
-def test_compaction_writes_several_chunks_when_they_are_small(table):
+def test_compaction_writes_several_chunks_when_they_are_small(table, cfg):
     """A chunk cap below the table size must flush repeatedly, not once."""
     before = _rows(table)
 
-    outcome = compact_table(table, table.io, _cfg(rewrite_chunk_bytes=4096))
+    outcome = compact_table(table, table.io, cfg(rewrite_chunk_bytes=4096))
 
-    assert outcome.startswith("compacted"), outcome
+    assert outcome.kind == "compacted", outcome
     table.refresh()
     assert len(_data_files(table)) > 1
     assert _rows(table) == before
@@ -146,7 +89,7 @@ def test_stream_batches_reads_one_file_at_a_time(table, monkeypatch):
 
     scan = table.scan()
     tasks = list(scan.plan_files())
-    assert len(tasks) == _FILES
+    assert len(tasks) == FILES
 
     batches = stream_batches(scan, tasks)
     first = next(batches)
@@ -154,12 +97,12 @@ def test_stream_batches_reads_one_file_at_a_time(table, monkeypatch):
 
     # ...and the rest still arrive: laziness must not lose data.
     rows = first.num_rows + sum(batch.num_rows for batch in batches)
-    assert rows == _FILES * _ROWS_PER_FILE
+    assert rows == FILES * ROWS_PER_FILE
     assert opened == [task.file.file_path for task in tasks]
 
 
 def test_unrewritable_manifest_is_skipped_before_anything_is_written(
-    table, monkeypatch
+    table, cfg, monkeypatch
 ):
     """A manifest PyIceberg can't decode must cost nothing, not a full rewrite.
 
@@ -187,9 +130,10 @@ def test_unrewritable_manifest_is_skipped_before_anything_is_written(
     monkeypatch.setattr(ManifestFile, "fetch_manifest_entry", shifted)
 
     before = _data_files(table)
-    outcome = compact_table(table, table.io, _cfg())
+    outcome = compact_table(table, table.io, cfg())
 
-    assert outcome.startswith("SKIPPED: manifest entry status is"), outcome
+    assert outcome.kind == "unsupported", outcome
+    assert outcome.message.startswith("SKIPPED: manifest entry status is"), outcome
     table.refresh()
     assert _data_files(table) == before
 

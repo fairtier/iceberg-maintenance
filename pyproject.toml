@@ -17,6 +17,15 @@ dependencies = [
     # above; declared here because we import it by name. Left unpinned so uv
     # resolves it inside pyiceberg's own constraint.
     "pyarrow",
+    # Observability (src/iceberg_maintenance/telemetry.py). Only the API is
+    # imported at module scope; the SDK, the exporter and the requests
+    # instrumentation are imported lazily and only on a box that has a
+    # collector. OTLP over HTTP, not gRPC, to keep grpcio wheels (and their
+    # arm64 build) out of the image.
+    "opentelemetry-api>=1.30",
+    "opentelemetry-sdk>=1.30",
+    "opentelemetry-exporter-otlp-proto-http>=1.30",
+    "opentelemetry-instrumentation-requests>=0.51b0",
 ]
 
 [project.urls]

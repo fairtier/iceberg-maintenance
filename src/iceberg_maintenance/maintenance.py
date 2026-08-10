@@ -14,6 +14,10 @@ Safe against concurrent dlt loads: Iceberg's optimistic concurrency turns a
 clash into a failed commit here (logged, retried next night), never corrupted
 data.
 
+Every per-table operation reports an `Outcome` — a label a metric can count
+plus the sentence a human reads — and the whole run is one trace when a
+collector is configured (see telemetry.py).
+
 Deliberately NOT handled here:
   - orphan-file removal — no OSS option exists. Lakekeeper's
     remove_orphan_files task queue is Enterprise-only, and PyIceberg's
@@ -37,8 +41,12 @@ import itertools
 import logging
 import time
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from functools import partial
 
 import pyarrow
+from opentelemetry.trace import Span, StatusCode
 from pyiceberg.catalog import load_catalog
 from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.expressions import AlwaysTrue
@@ -60,10 +68,43 @@ from pyiceberg.io.pyarrow import (
 )
 from pyiceberg.manifest import ManifestContent, ManifestEntryStatus
 
+from . import telemetry
 from .config import MIB, Config, load_config
+from .telemetry import tracer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("maintenance")
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """What one per-table operation did.
+
+    Two audiences, one object: `kind` is the low-cardinality label a dashboard
+    counts (`iceberg.outcome` on spans and metrics), `message` is the sentence
+    an operator reads in the log. Split so neither has to be derived from the
+    other — no dashboard parsing prose, and no prose flattened to fit a label.
+
+    `kind` is a closed vocabulary:
+
+      compacted    the table was rewritten and the swap committed
+      healthy      nothing to do — too few small files to bother
+      skipped      compaction declined this table for now (write amplification,
+                   or a scan that surprised us by yielding no rows)
+      unsupported  compaction can never run here as things stand: delete files,
+                   or manifests PyIceberg cannot decode
+      empty        no snapshot at all
+      expired      snapshots were expired
+      nothing      expiry had nothing outside the window and floor
+      conflict     lost the commit race to a concurrent write; retried next run
+      failed       raised
+    """
+
+    kind: str
+    message: str
+
+    def __str__(self) -> str:
+        return self.message
 
 
 def direct_s3_io(cfg: Config) -> PyArrowFileIO:
@@ -206,34 +247,70 @@ def unrewritable_manifest_reason(table, snapshot) -> str | None:
     return None
 
 
-def compact_table(table, s3_io, cfg: Config) -> str:
-    """Compact one table if it needs it; returns a human-readable outcome."""
+def compact_table(table, s3_io, cfg: Config) -> Outcome:
+    """Compact one table if it needs it; returns a structured outcome.
+
+    The span wrapper lives out here so that *every* return path below — each
+    gate, each skip — lands its `iceberg.outcome` on the span without the body
+    having to remember to.
+    """
+    with tracer.start_as_current_span(
+        "iceberg.compact", attributes={"iceberg.table": ".".join(table.name())}
+    ) as span:
+        outcome = _compact_table(span, table, s3_io, cfg)
+        span.set_attribute("iceberg.outcome", outcome.kind)
+        return outcome
+
+
+def _compact_table(span: Span, table, s3_io, cfg: Config) -> Outcome:
     snapshot = table.current_snapshot()
     if snapshot is None:
-        return "empty (no snapshot)"
+        return Outcome("empty", "empty (no snapshot)")
 
     # Merge-on-read delete files (DuckFlight UPDATE/DELETE/MERGE) make a
     # naive COW rewrite unsafe — skip and say so.
     summary = snapshot.summary or {}
     if int(summary.get("total-delete-files", 0) or 0) > 0:
-        return "SKIPPED: has delete files (merge-on-read writes) — compaction not supported yet"
+        return Outcome(
+            "unsupported",
+            "SKIPPED: has delete files (merge-on-read writes) — compaction not supported yet",
+        )
 
     table.io = s3_io
 
     # One scan object for both the plan and the read below — planning twice
     # would re-fetch the manifests for nothing.
-    scan = table.scan()
-    tasks = list(scan.plan_files())
+    with tracer.start_as_current_span("iceberg.compact.plan"):
+        scan = table.scan()
+        tasks = list(scan.plan_files())
     if any(task.delete_files for task in tasks):
-        return "SKIPPED: has delete files (merge-on-read writes) — compaction not supported yet"
+        return Outcome(
+            "unsupported",
+            "SKIPPED: has delete files (merge-on-read writes) — compaction not supported yet",
+        )
 
     sizes = [task.file.file_size_in_bytes for task in tasks]
     total = sum(sizes)
     small = sum(1 for s in sizes if s < cfg.small_file_max_bytes)
     small_bytes = sum(s for s in sizes if s < cfg.small_file_max_bytes)
 
+    # The shape of the table as the gates below see it — recorded whether or
+    # not a rewrite follows, so a table that never gets compacted still shows
+    # *why* in the trace.
+    span.set_attributes(
+        {
+            "iceberg.compaction.input.files": len(sizes),
+            "iceberg.compaction.input.bytes": total,
+            "iceberg.compaction.small.files": small,
+            "iceberg.compaction.small.bytes": small_bytes,
+        }
+    )
+
     if small < cfg.min_input_files:
-        return f"healthy ({len(sizes)} files, {small} small, {total / MIB:.1f} MiB)"
+        return Outcome(
+            "healthy",
+            f"healthy ({len(sizes)} files, {small} small, {total / MIB:.1f} MiB)",
+        )
 
     # Write-amplification gate (NOT a memory gate — the rewrite below is O(1) in
     # table size). Whole-table overwrite rewrites *every* file, so skip when the
@@ -242,19 +319,24 @@ def compact_table(table, s3_io, cfg: Config) -> str:
     # churn. When a per-file swap primitive exists we'll bin-pack just the small
     # files instead.
     fraction = small_bytes / total if total else 0.0
+    span.set_attribute("iceberg.compaction.small.fraction", fraction)
     if fraction < cfg.rewrite_min_small_fraction:
-        return (
+        return Outcome(
+            "skipped",
             f"skipped: {small} small files are only {fraction:.0%} of {total / MIB:.1f} MiB "
             f"(< {cfg.rewrite_min_small_fraction:.0%}) — not worth a whole-table rewrite; "
-            "waiting on per-file bin-packing"
+            "waiting on per-file bin-packing",
         )
 
     # Last gate, and the only one that costs a manifest read — so it runs after
     # the free ones: can the swap this is about to work for even commit?
-    if reason := unrewritable_manifest_reason(table, snapshot):
-        return (
+    with tracer.start_as_current_span("iceberg.compact.check_manifests"):
+        reason = unrewritable_manifest_reason(table, snapshot)
+    if reason:
+        return Outcome(
+            "unsupported",
             f"SKIPPED: {reason} — written by another engine, so a rewrite would "
-            "fail at commit; snapshot expiry still runs"
+            "fail at commit; snapshot expiry still runs",
         )
 
     # Streamed, atomic rewrite — peak memory is O(1) in table size (bounded by
@@ -288,29 +370,12 @@ def compact_table(table, s3_io, cfg: Config) -> str:
     pending = []
     pending_bytes = 0
 
-    def _flush():
-        nonlocal pending, pending_bytes
-        if not pending:
-            return
-        chunk = pyarrow.Table.from_batches(pending)
-        pending = []
-        pending_bytes = 0
-        data_files.extend(
-            _dataframe_to_data_files(
-                table_metadata=table.metadata,
-                df=chunk,
-                io=table.io,
-                write_uuid=write_uuid,
-                counter=counter,
-            )
-        )
-        del chunk
-        release_memory()
-        log.info("%s: %d data file(s) written", ".".join(table.name()), len(data_files))
-
     # Progress, not decoration: the whole rewrite is one long silent stretch,
     # and when the 2026-07-31 run was OOM-killed mid-table the log did not even
-    # say which table it had moved on to.
+    # say which table it had moved on to. The span is the same story told to a
+    # collector — it is where the run's wall time actually goes — and the chunk
+    # events inside it are what turns "killed mid-rewrite" into "killed after
+    # chunk 7 of a 12 GiB table".
     log.info(
         "%s: rewriting %d files (%.1f MiB, %d small) in ~%d MiB chunks",
         ".".join(table.name()),
@@ -319,17 +384,67 @@ def compact_table(table, s3_io, cfg: Config) -> str:
         small,
         cfg.rewrite_chunk_bytes // MIB,
     )
-    for batch in stream_batches(scan, tasks):
-        pending.append(batch)
-        pending_bytes += batch.nbytes
-        if pending_bytes >= cfg.rewrite_chunk_bytes:
-            _flush()
-    _flush()
+    with tracer.start_as_current_span(
+        "iceberg.compact.rewrite",
+        attributes={"iceberg.compaction.chunk.bytes": cfg.rewrite_chunk_bytes},
+    ) as rewrite_span:
+
+        def _flush():
+            nonlocal pending, pending_bytes
+            if not pending:
+                return
+            chunk = pyarrow.Table.from_batches(pending)
+            chunk_rows, chunk_bytes = chunk.num_rows, pending_bytes
+            pending = []
+            pending_bytes = 0
+            data_files.extend(
+                _dataframe_to_data_files(
+                    table_metadata=table.metadata,
+                    df=chunk,
+                    io=table.io,
+                    write_uuid=write_uuid,
+                    counter=counter,
+                )
+            )
+            del chunk
+            release_memory()
+            log.info(
+                "%s: %d data file(s) written", ".".join(table.name()), len(data_files)
+            )
+            # An event, not a span: a chunk has no interesting internal
+            # structure, and a 12 GiB table would otherwise mint a hundred
+            # near-identical spans.
+            rewrite_span.add_event(
+                "chunk written",
+                {
+                    "iceberg.compaction.chunk.rows": chunk_rows,
+                    "iceberg.compaction.chunk.bytes": chunk_bytes,
+                    "iceberg.compaction.output.files": len(data_files),
+                },
+            )
+
+        for batch in stream_batches(scan, tasks):
+            pending.append(batch)
+            pending_bytes += batch.nbytes
+            if pending_bytes >= cfg.rewrite_chunk_bytes:
+                _flush()
+        _flush()
+
+        written_bytes = sum(data_file.file_size_in_bytes for data_file in data_files)
+        rewrite_span.set_attributes(
+            {
+                "iceberg.compaction.output.files": len(data_files),
+                "iceberg.compaction.output.bytes": written_bytes,
+            }
+        )
 
     if not data_files:
         # The scan yielded no rows despite planned files — never empty the table
         # on a surprise; leave it as-is and say so.
-        return f"skipped: scan produced no rows ({len(sizes)} files planned) — table left untouched"
+        return Outcome(
+            "skipped",
+            f"skipped: scan produced no rows ({len(sizes)} files planned) — table left untouched",
+        )
 
     # Phase 2 (fast; metadata-only): one transaction that atomically drops every
     # old data file and adds the new ones. delete(AlwaysTrue()) on a delete-free
@@ -339,19 +454,31 @@ def compact_table(table, s3_io, cfg: Config) -> str:
     # here also leaves the table untouched. A concurrent dlt load that advanced
     # the branch loses the commit race (CommitFailedException, caught by the
     # caller and retried next night), exactly as the stock overwrite would.
-    with table.transaction() as tx:
+    with (
+        tracer.start_as_current_span("iceberg.compact.commit"),
+        table.transaction() as tx,
+    ):
         tx.delete(delete_filter=AlwaysTrue())
         with tx._append_snapshot_producer({}) as append_files:
             for data_file in data_files:
                 append_files.append_data_file(data_file)
 
-    return (
+    # Counted only now: everything above this line is work that a lost commit
+    # race turns into orphan parquet, and a "files rewritten" chart that
+    # includes it would be measuring effort, not effect.
+    span.set_attribute("iceberg.compaction.output.files", len(data_files))
+    telemetry.files_rewritten.add(len(sizes))
+    telemetry.files_written.add(len(data_files))
+    telemetry.bytes_rewritten.add(total)
+
+    return Outcome(
+        "compacted",
         f"compacted {len(sizes)} files ({small} small, {total / MIB:.1f} MiB) into "
-        f"{len(data_files)} file(s) via a streamed rewrite"
+        f"{len(data_files)} file(s) via a streamed rewrite",
     )
 
 
-def expire_snapshots(table, cfg: Config) -> str:
+def expire_snapshots(table, cfg: Config) -> Outcome:
     """Expire snapshots past the time-travel window; metadata-only.
 
     Never expires branch heads or tags (PyIceberg protects those too), and
@@ -360,9 +487,19 @@ def expire_snapshots(table, cfg: Config) -> str:
     of expired snapshots are NOT deleted — see the module docstring on the
     missing orphan sweep.
     """
+    with tracer.start_as_current_span(
+        "iceberg.expire_snapshots", attributes={"iceberg.table": ".".join(table.name())}
+    ) as span:
+        outcome = _expire_snapshots(span, table, cfg)
+        span.set_attribute("iceberg.outcome", outcome.kind)
+        return outcome
+
+
+def _expire_snapshots(span: Span, table, cfg: Config) -> Outcome:
     snaps = sorted(table.metadata.snapshots, key=lambda s: s.timestamp_ms, reverse=True)
+    span.set_attribute("iceberg.snapshots.total", len(snaps))
     if not snaps:
-        return "nothing to expire (no snapshots)"
+        return Outcome("nothing", "nothing to expire (no snapshots)")
 
     protected = {ref.snapshot_id for ref in table.metadata.refs.values()}
     keep_floor = {s.snapshot_id for s in snaps[: cfg.min_snapshots_to_keep]}
@@ -374,71 +511,147 @@ def expire_snapshots(table, cfg: Config) -> str:
         and s.snapshot_id not in protected
         and s.snapshot_id not in keep_floor
     ]
+    span.set_attribute("iceberg.snapshots.expirable", len(expirable))
     if not expirable:
-        return f"nothing to expire ({len(snaps)} snapshots, all within window/floor)"
+        return Outcome(
+            "nothing",
+            f"nothing to expire ({len(snaps)} snapshots, all within window/floor)",
+        )
 
     table.maintenance.expire_snapshots().by_ids(expirable).commit()
-    return f"expired {len(expirable)} of {len(snaps)} snapshots"
+    telemetry.snapshots_expired.add(len(expirable))
+    return Outcome("expired", f"expired {len(expirable)} of {len(snaps)} snapshots")
 
 
-def main() -> int:
-    cfg = load_config()
-    catalog = load_catalog(
-        "box",
-        **{
-            "type": "rest",
-            "uri": cfg.catalog_uri,
-            "warehouse": cfg.warehouse,
-            "credential": cfg.credential,
-            "oauth2-server-uri": cfg.oidc_token_url,
-        },
-    )
-    s3_io = direct_s3_io(cfg)
+def run_operation(
+    name: str, operation: str, label: str, work: Callable[[], Outcome]
+) -> Outcome:
+    """Run one per-table operation: log it, time it, count it, never raise.
 
+    The two operations fail the same two ways — a lost commit race (transient,
+    retried next run, not the run's fault) and everything else (an error) — so
+    the handling lives here once, and the caller is left deciding only what an
+    outcome means for the exit code.
+    """
+    started = time.monotonic()
+    try:
+        outcome = work()
+        log.info("%s: %s: %s", name, label, outcome)
+    except CommitFailedException as exc:
+        # Concurrent write won the race — fine, next night retries.
+        log.warning(
+            "%s: %s commit conflict (concurrent write?), retrying next run: %s",
+            name,
+            label,
+            exc,
+        )
+        outcome = Outcome("conflict", str(exc))
+    except Exception as exc:
+        log.exception("%s: %s failed", name, label)
+        outcome = Outcome("failed", str(exc))
+    telemetry.record_operation(operation, outcome.kind, time.monotonic() - started)
+    return outcome
+
+
+def maintain_warehouse(catalog, s3_io, cfg: Config) -> tuple[int, int]:
+    """Compact + expire every table in the warehouse; returns (tables, errors)."""
     tables = 0
     errors = 0
     for ns in all_namespaces(catalog):
         for ident in catalog.list_tables(ns):
             tables += 1
             name = ".".join(ident)
-            try:
-                table = catalog.load_table(ident)
-            except Exception:
-                log.exception("%s: load failed", name)
-                errors += 1
-                continue
+            telemetry.tables_scanned.add(1)
+            with tracer.start_as_current_span(
+                "iceberg.maintenance.table",
+                attributes={
+                    "iceberg.table": name,
+                    "iceberg.namespace": ".".join(ident[:-1]),
+                },
+            ) as table_span:
+                started = time.monotonic()
+                try:
+                    with tracer.start_as_current_span("iceberg.catalog.load_table"):
+                        table = catalog.load_table(ident)
+                except Exception:
+                    log.exception("%s: load failed", name)
+                    errors += 1
+                    table_span.set_status(StatusCode.ERROR, "load failed")
+                    # Only the failures are counted here — a table that loads
+                    # goes on to be counted by the two operations below, and
+                    # the run's denominator is tables.scanned.
+                    telemetry.record_operation(
+                        "load_table", "failed", time.monotonic() - started
+                    )
+                    continue
 
-            try:
-                log.info("%s: compaction: %s", name, compact_table(table, s3_io, cfg))
-            except CommitFailedException as exc:
-                # Concurrent write won the race — fine, next night retries.
-                log.warning(
-                    "%s: compaction commit conflict (concurrent write?), retrying next run: %s",
+                # partial, not a lambda: `table` is deleted at the end of this
+                # loop body, so a late-bound closure over it would be reading a
+                # name that is gone by then.
+                compaction = run_operation(
                     name,
-                    exc,
+                    "compact",
+                    "compaction",
+                    partial(compact_table, table, s3_io, cfg),
                 )
-            except Exception:
-                log.exception("%s: compaction failed", name)
-                errors += 1
-
-            # Expiry runs even when compaction skipped or failed — it is
-            # metadata-only and safe for merge-on-read tables too.
-            try:
-                log.info("%s: snapshot expiry: %s", name, expire_snapshots(table, cfg))
-            except CommitFailedException as exc:
-                log.warning(
-                    "%s: expiry commit conflict (concurrent write?), retrying next run: %s",
+                # Expiry runs even when compaction skipped or failed — it is
+                # metadata-only and safe for merge-on-read tables too.
+                expiry = run_operation(
                     name,
-                    exc,
+                    "expire_snapshots",
+                    "snapshot expiry",
+                    partial(expire_snapshots, table, cfg),
                 )
-            except Exception:
-                log.exception("%s: snapshot expiry failed", name)
-                errors += 1
+                # A conflict is not an error: the next run retries it. Anything
+                # that raised is, and it fails the whole job's exit code.
+                failed = [o for o in (compaction, expiry) if o.kind == "failed"]
+                errors += len(failed)
+                if failed:
+                    table_span.set_status(StatusCode.ERROR)
 
-            # Bound the run's RSS high-water to the single largest table, not
-            # the sum across the loop, before moving on.
-            del table
-            release_memory()
+                # Bound the run's RSS high-water to the single largest table,
+                # not the sum across the loop, before moving on.
+                del table
+                release_memory()
 
-    log.info("done: %d tables scanned, %d errors", tables, errors)
-    return 1 if errors else 0
+    return tables, errors
+
+
+def main() -> int:
+    cfg = load_config()
+    # Set up before anything else worth tracing, torn down in the finally: a
+    # CronJob exits long before batched spans and periodic metrics would flush
+    # on their own, so an unflushed run reports nothing at all.
+    shutdown_telemetry = telemetry.setup(cfg)
+    started = time.monotonic()
+    run_outcome = "failed"
+    try:
+        with tracer.start_as_current_span("iceberg.maintenance.run") as run_span:
+            catalog = load_catalog(
+                "box",
+                **{
+                    "type": "rest",
+                    "uri": cfg.catalog_uri,
+                    "warehouse": cfg.warehouse,
+                    "credential": cfg.credential,
+                    "oauth2-server-uri": cfg.oidc_token_url,
+                },
+            )
+            s3_io = direct_s3_io(cfg)
+
+            tables, errors = maintain_warehouse(catalog, s3_io, cfg)
+            run_outcome = "errors" if errors else "ok"
+            run_span.set_attributes(
+                {
+                    "iceberg.tables.scanned": tables,
+                    "iceberg.tables.failed": errors,
+                    "iceberg.outcome": run_outcome,
+                }
+            )
+            log.info("done: %d tables scanned, %d errors", tables, errors)
+            return 1 if errors else 0
+    finally:
+        telemetry.run_duration.record(
+            time.monotonic() - started, {"iceberg.outcome": run_outcome}
+        )
+        shutdown_telemetry()
