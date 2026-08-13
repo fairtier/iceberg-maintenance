@@ -64,6 +64,14 @@ corrupted data).
   is written, since discovering it at commit time means a whole table rewritten
   into orphan files for nothing. Snapshot expiry still runs.
 
+  This is not a rare edge: **every table a dbt model materializes through
+  DuckDB lands this way**, so a warehouse's un-compactable share grows with its
+  transformation layer, not with anything the operator did. It stayed invisible
+  until 2026-08-13 because expiry still ran and the run reported "0 errors" —
+  which is why both cases above are now **counted** and published as
+  `iceberg_maintenance_tables_unsupported`, distinct from both a success and a
+  failure. Neither is a run error, and neither is fine.
+
 ## Usage
 
 ```bash
@@ -113,6 +121,40 @@ chart). Defaults mirror that chart's `values.yaml`.
 | `REWRITE_CHUNK_BYTES`        | `134217728`    | Streaming chunk size — the **only** thing that sets peak rewrite memory (constant in table size), and the approximate output data-file size |
 | `MAX_SNAPSHOT_AGE_MS`        | `604800000`    | Time-travel window; snapshots older than this are expired (7 days)         |
 | `MIN_SNAPSHOTS_TO_KEEP`      | `5`            | Retention floor: always keep the newest N snapshots regardless of age      |
+| `TEXTFILE_PATH`              | *(unset)*      | Write the run's numbers here as a node_exporter textfile — see below. Unset writes nothing |
+
+### Observability without a collector (node_exporter textfile)
+
+OTLP below is the richer signal, but it needs a collector on the far end. Set
+`TEXTFILE_PATH=/textfile/iceberg_maintenance.prom` and a **clean** run also
+writes three gauges to a file the box's existing node exporter already scrapes:
+
+| Metric | Meaning |
+|---|---|
+| `iceberg_maintenance_last_success_timestamp_seconds` | When the last error-free run finished |
+| `iceberg_maintenance_tables_scanned` | Tables it visited |
+| `iceberg_maintenance_tables_unsupported` | Tables it **could not compact at all** |
+
+Three things about it are deliberate:
+
+- **A run with any error writes nothing.** `last_success` has to mean last
+  success or a staleness alert built on it is a lie, so a failed run leaves
+  the previous value standing and lets it go stale.
+- **It is written to a temp file and renamed.** The exporter can scrape
+  mid-write, and a half-written file fails the parse for the *whole* scrape,
+  not just this metric.
+- **A failure to write it does not fail the run.** A warehouse that was
+  maintained correctly must not be reported as broken because a hostPath was
+  not mounted; the staleness alert covers a heartbeat that stops arriving.
+
+`tables_unsupported` is the one worth wiring an alert to. It counts tables
+compaction can never run on as things stand — delete files, or manifests
+PyIceberg cannot decode — as distinct from the `skipped` outcome, which is the
+write-amplification gate declining a healthy table and is normal every night.
+Snapshot expiry still runs on unsupported tables, which is exactly why they
+look fine from the outside: one production box carried an un-compactable dbt
+staging table for weeks while every run reported "12 tables scanned, 0 errors"
+and stamped a success heartbeat.
 
 ### Observability (OpenTelemetry)
 
@@ -157,10 +199,13 @@ client and stays invisible.
 
 `iceberg.outcome` is the headline label — `compacted`, `healthy`, `skipped`,
 `unsupported`, `empty`, `expired`, `nothing`, `conflict`, `failed` (see
-`Outcome` in `maintenance.py`). Alert on `failed`; a rising `conflict` means
-compaction keeps losing the commit race to concurrent dlt loads. Table names
-are deliberately **spans-only**, never metric attributes — the counters answer
-"did tonight go well", the trace answers "which table".
+`Outcome` in `maintenance.py`). Alert on `failed`, and on a standing
+`unsupported`; a rising `conflict` means compaction keeps losing the commit
+race to concurrent dlt loads. Table names are deliberately **spans-only**,
+never metric attributes — the counters answer "did tonight go well", the trace
+answers "which table". (The run's closing log line is the exception, and names
+the un-compactable tables outright: a count of 1 is only actionable if you
+know which one.)
 
 Two things this job does because it is a CronJob and not a server: it
 force-flushes both pipelines at exit (a batch process dies long before batched

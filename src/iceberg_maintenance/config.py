@@ -71,6 +71,13 @@ class Config:
     # on a box with no collector.
     otel_enabled: bool = False
 
+    # --- Observability that survives the run (see maintenance.write_textfile) ---
+    # A node_exporter textfile. The OTLP metrics above are the richer signal but
+    # they need a collector on the far end; this is one file on a shared
+    # hostPath, scraped by whatever node exporter the box already runs, and it
+    # is what the fleet alerts read. Empty (the default) writes nothing.
+    textfile_path: str = ""
+
     @property
     def credential(self) -> str:
         """PyIceberg REST `credential` string (`client_id:client_secret`)."""
@@ -99,4 +106,5 @@ def load_config() -> Config:
         ),
         min_snapshots_to_keep=int(os.environ.get("MIN_SNAPSHOTS_TO_KEEP", "5")),
         otel_enabled=_otel_enabled(),
+        textfile_path=os.environ.get("TEXTFILE_PATH", ""),
     )

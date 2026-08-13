@@ -39,10 +39,11 @@ platform repo.
 import gc
 import itertools
 import logging
+import os
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 
 import pyarrow
@@ -553,13 +554,39 @@ def run_operation(
     return outcome
 
 
-def maintain_warehouse(catalog, s3_io, cfg: Config) -> tuple[int, int]:
-    """Compact + expire every table in the warehouse; returns (tables, errors)."""
-    tables = 0
-    errors = 0
+@dataclass
+class RunSummary:
+    """What the whole run did, in the three numbers an operator needs.
+
+    `unsupported` is the one this class exists for. It is deliberately NOT
+    folded into `errors`: an un-compactable table did not fail, and making the
+    run exit non-zero would send the Job into its backoff for a condition that
+    is identical on the retry. But it is not a success either — the table is
+    permanently not being compacted, and until 2026-08-13 that fact appeared
+    nowhere: the run logged one SKIPPED line among a hundred, reported
+    "12 tables scanned, 0 errors", exited 0 and stamped the success heartbeat.
+    A production box carried an un-compactable dbt staging table for weeks that
+    way.
+
+    So it gets a number of its own, and `unsupported_tables` carries the names,
+    because "1 un-compactable" is only actionable if you know which one.
+    """
+
+    tables: int = 0
+    errors: int = 0
+    unsupported_tables: list[str] = field(default_factory=list)
+
+    @property
+    def unsupported(self) -> int:
+        return len(self.unsupported_tables)
+
+
+def maintain_warehouse(catalog, s3_io, cfg: Config) -> RunSummary:
+    """Compact + expire every table in the warehouse."""
+    summary = RunSummary()
     for ns in all_namespaces(catalog):
         for ident in catalog.list_tables(ns):
-            tables += 1
+            summary.tables += 1
             name = ".".join(ident)
             telemetry.tables_scanned.add(1)
             with tracer.start_as_current_span(
@@ -575,7 +602,7 @@ def maintain_warehouse(catalog, s3_io, cfg: Config) -> tuple[int, int]:
                         table = catalog.load_table(ident)
                 except Exception:
                     log.exception("%s: load failed", name)
-                    errors += 1
+                    summary.errors += 1
                     table_span.set_status(StatusCode.ERROR, "load failed")
                     # Only the failures are counted here — a table that loads
                     # goes on to be counted by the two operations below, and
@@ -605,16 +632,64 @@ def maintain_warehouse(catalog, s3_io, cfg: Config) -> tuple[int, int]:
                 # A conflict is not an error: the next run retries it. Anything
                 # that raised is, and it fails the whole job's exit code.
                 failed = [o for o in (compaction, expiry) if o.kind == "failed"]
-                errors += len(failed)
+                summary.errors += len(failed)
                 if failed:
                     table_span.set_status(StatusCode.ERROR)
+
+                # Un-compactable is a standing condition, not a run failure —
+                # see RunSummary. Only compaction can produce it; expiry runs
+                # on these tables regardless, which is why they look fine.
+                if compaction.kind == "unsupported":
+                    summary.unsupported_tables.append(name)
 
                 # Bound the run's RSS high-water to the single largest table,
                 # not the sum across the loop, before moving on.
                 del table
                 release_memory()
 
-    return tables, errors
+    return summary
+
+
+def write_textfile(path: str, summary: RunSummary) -> None:
+    """Publish the run's numbers as a node_exporter textfile.
+
+    Called only after a clean run (`errors == 0`) — the timestamp means "the
+    last time this box finished a maintenance pass", which is what
+    `BoxIcebergMaintenanceStale` reads, so a failed run must leave the previous
+    value standing rather than refresh it.
+
+    Written to a temp file in the same directory and renamed, because the node
+    exporter may scrape mid-write and a half-written file is a parse error for
+    the whole scrape, not just this metric.
+
+    This used to live in a shell wrapper in the chart, to avoid rebuilding the
+    image for a heartbeat. It moved here when the un-compactable count needed
+    publishing too: the wrapper could only see the exit code, and the whole
+    point of that count is that it is invisible in the exit code.
+    """
+    directory = os.path.dirname(path) or "."
+    tmp = f"{path}.tmp"
+    body = (
+        "# HELP iceberg_maintenance_last_success_timestamp_seconds Unix time of "
+        "the last maintenance run that completed with no errors.\n"
+        "# TYPE iceberg_maintenance_last_success_timestamp_seconds gauge\n"
+        f"iceberg_maintenance_last_success_timestamp_seconds {int(time.time())}\n"
+        "# HELP iceberg_maintenance_tables_scanned Tables visited by the last "
+        "clean run.\n"
+        "# TYPE iceberg_maintenance_tables_scanned gauge\n"
+        f"iceberg_maintenance_tables_scanned {summary.tables}\n"
+        "# HELP iceberg_maintenance_tables_unsupported Tables the last clean run "
+        "could not compact at all (delete files, or manifests PyIceberg cannot "
+        "decode). Snapshot expiry still runs on them.\n"
+        "# TYPE iceberg_maintenance_tables_unsupported gauge\n"
+        f"iceberg_maintenance_tables_unsupported {summary.unsupported}\n"
+    )
+    os.makedirs(directory, exist_ok=True)
+    with open(tmp, "w") as fh:
+        fh.write(body)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+    log.info("wrote %s", path)
 
 
 def main() -> int:
@@ -639,17 +714,36 @@ def main() -> int:
             )
             s3_io = direct_s3_io(cfg)
 
-            tables, errors = maintain_warehouse(catalog, s3_io, cfg)
-            run_outcome = "errors" if errors else "ok"
+            summary = maintain_warehouse(catalog, s3_io, cfg)
+            run_outcome = "errors" if summary.errors else "ok"
             run_span.set_attributes(
                 {
-                    "iceberg.tables.scanned": tables,
-                    "iceberg.tables.failed": errors,
+                    "iceberg.tables.scanned": summary.tables,
+                    "iceberg.tables.failed": summary.errors,
+                    "iceberg.tables.unsupported": summary.unsupported,
                     "iceberg.outcome": run_outcome,
                 }
             )
-            log.info("done: %d tables scanned, %d errors", tables, errors)
-            return 1 if errors else 0
+            log.info(
+                "done: %d tables scanned, %d errors, %d un-compactable%s",
+                summary.tables,
+                summary.errors,
+                summary.unsupported,
+                f" ({', '.join(summary.unsupported_tables)})"
+                if summary.unsupported_tables
+                else "",
+            )
+            if summary.errors:
+                return 1
+            if cfg.textfile_path:
+                # Best-effort: a warehouse that was maintained correctly must
+                # not be reported as a failed run because a hostPath was not
+                # mounted. The staleness alert covers a heartbeat that stops.
+                try:
+                    write_textfile(cfg.textfile_path, summary)
+                except Exception:
+                    log.exception("could not write %s", cfg.textfile_path)
+            return 0
     finally:
         telemetry.run_duration.record(
             time.monotonic() - started, {"iceberg.outcome": run_outcome}
