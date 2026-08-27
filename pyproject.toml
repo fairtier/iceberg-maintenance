@@ -1,6 +1,6 @@
 [project]
 name = "iceberg-maintenance"
-version = "0.5.0"
+version = "0.6.0"
 description = "Nightly Iceberg table maintenance (small-file compaction + snapshot expiry) for a FairTier box warehouse"
 readme = "README.md"
 license = "Apache-2.0"

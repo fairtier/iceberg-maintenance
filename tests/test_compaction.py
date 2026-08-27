@@ -9,6 +9,7 @@ rather than after a full rewrite.
 The warehouse fixture and the config factory live in conftest.py.
 """
 
+import pytest
 from conftest import FILES, ROWS_PER_FILE
 
 from iceberg_maintenance.maintenance import (
@@ -101,16 +102,14 @@ def test_stream_batches_reads_one_file_at_a_time(table, monkeypatch):
     assert opened == [task.file.file_path for task in tasks]
 
 
-def test_unrewritable_manifest_is_skipped_before_anything_is_written(
-    table, cfg, monkeypatch
-):
-    """A manifest PyIceberg can't decode must cost nothing, not a full rewrite.
+def _shift_manifest_entry_headers(monkeypatch):
+    """Make PyIceberg mis-decode this warehouse's manifests, as DuckDB's do.
 
     Tables written by DuckDB's Iceberg writer come back with the entry header
     shifted (`status` holding the snapshot id, `sequence_number` None), so the
     swap's delete manifest is rejected at commit — after the whole table has
-    already been streamed into fresh parquet. Simulated here by mangling the
-    decoded entries the same way.
+    already been streamed into fresh parquet. Simulated by mangling the decoded
+    entries the same way.
     """
     from pyiceberg.manifest import ManifestFile
 
@@ -129,6 +128,13 @@ def test_unrewritable_manifest_is_skipped_before_anything_is_written(
 
     monkeypatch.setattr(ManifestFile, "fetch_manifest_entry", shifted)
 
+
+def test_unrewritable_manifest_is_skipped_before_anything_is_written(
+    table, cfg, monkeypatch
+):
+    """A manifest PyIceberg can't decode must cost nothing, not a full rewrite."""
+    _shift_manifest_entry_headers(monkeypatch)
+
     before = _data_files(table)
     outcome = compact_table(table, table.io, cfg())
 
@@ -136,6 +142,35 @@ def test_unrewritable_manifest_is_skipped_before_anything_is_written(
     assert outcome.message.startswith("SKIPPED: manifest entry status is"), outcome
     table.refresh()
     assert _data_files(table) == before
+
+
+@pytest.mark.parametrize(
+    "not_a_candidate",
+    [
+        # Every file is above the small-file threshold, so none of them counts
+        # toward min_input_files: fokume's staging.stg_trips / marts.fct_trips
+        # after SMALL_FILE_MAX_BYTES dropped to 8 MiB on 2026-08-27.
+        pytest.param({"small_file_max_bytes": 1}, id="below-min-input-files"),
+        # Small files are a sliver of a big table — the write-amplification gate.
+        pytest.param({"rewrite_min_small_fraction": 1.1}, id="below-small-fraction"),
+    ],
+)
+def test_unrewritable_manifest_is_reported_even_when_not_a_candidate(
+    table, cfg, monkeypatch, not_a_candidate
+):
+    """The regression guard for the 2026-08-27 silence.
+
+    `unsupported` counts tables compaction can never run on — a property of who
+    wrote the table, not of whether tonight's size gates happen to elect it. So
+    a table nobody would compact anyway must still be *reported*, or tuning a
+    threshold silently resolves BoxIcebergTablesUnsupported on a box where the
+    interop bug is exactly where it was.
+    """
+    _shift_manifest_entry_headers(monkeypatch)
+
+    outcome = compact_table(table, table.io, cfg(**not_a_candidate))
+
+    assert outcome.kind == "unsupported", outcome
 
 
 def test_healthy_manifests_are_not_reported_unrewritable(table):

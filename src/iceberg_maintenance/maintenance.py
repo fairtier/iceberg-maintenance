@@ -230,6 +230,10 @@ def unrewritable_manifest_reason(table, snapshot) -> str | None:
     read faithfully are entries we must not rewrite. Snapshot expiry still runs
     (it commits through the catalog and never touches manifests). The interop
     bug itself belongs upstream.
+
+    Asked of every table with a snapshot, not only of the ones tonight's size
+    gates elected — see the call site in `_compact_table` for why that
+    distinction cost a production signal.
     """
     for manifest in snapshot.manifests(io=table.io):
         if manifest.content != ManifestContent.DATA:
@@ -307,6 +311,38 @@ def _compact_table(span: Span, table, s3_io, cfg: Config) -> Outcome:
         }
     )
 
+    # Can the swap even commit? Asked of every table, and asked *before* the
+    # size gates below rather than after them.
+    #
+    # Whether PyIceberg can decode a table's manifests is a property of the
+    # table — of which engine wrote it — not of how many small files it happens
+    # to be carrying tonight. Behind the gates the question was only ever put
+    # to tables that were already compaction candidates, so `unsupported`
+    # quietly meant "un-compactable AND currently a candidate", and tuning a
+    # gate moved a signal that has nothing to do with tuning. It did: lowering
+    # SMALL_FILE_MAX_BYTES 32 MiB -> 8 MiB on 2026-08-27 took fokume's
+    # iceberg_maintenance_tables_unsupported from 2 to 0 without repairing
+    # anything, because staging.stg_trips and marts.fct_trips (~8.5 MiB/file)
+    # stopped clearing min_input_files and returned "healthy" one gate earlier.
+    # BoxIcebergTablesUnsupported would have resolved on a box where the
+    # interop bug was untouched — the same "a skipped table counts as a clean
+    # run" silence that RunSummary.unsupported exists to end.
+    #
+    # It costs a manifest-entry read on every table, but not a new one:
+    # plan_files above already fetched every data manifest's entries to build
+    # `tasks`; this re-reads the same avro for the entry-header halves the plan
+    # discards. The file counts ride along in the message because they are what
+    # says whether this table is merely un-compactable or actively rotting.
+    with tracer.start_as_current_span("iceberg.compact.check_manifests"):
+        reason = unrewritable_manifest_reason(table, snapshot)
+    if reason:
+        return Outcome(
+            "unsupported",
+            f"SKIPPED: {reason} — written by another engine, so a rewrite would "
+            f"fail at commit ({len(sizes)} files, {small} small, "
+            f"{total / MIB:.1f} MiB); snapshot expiry still runs",
+        )
+
     if small < cfg.min_input_files:
         return Outcome(
             "healthy",
@@ -327,17 +363,6 @@ def _compact_table(span: Span, table, s3_io, cfg: Config) -> Outcome:
             f"skipped: {small} small files are only {fraction:.0%} of {total / MIB:.1f} MiB "
             f"(< {cfg.rewrite_min_small_fraction:.0%}) — not worth a whole-table rewrite; "
             "waiting on per-file bin-packing",
-        )
-
-    # Last gate, and the only one that costs a manifest read — so it runs after
-    # the free ones: can the swap this is about to work for even commit?
-    with tracer.start_as_current_span("iceberg.compact.check_manifests"):
-        reason = unrewritable_manifest_reason(table, snapshot)
-    if reason:
-        return Outcome(
-            "unsupported",
-            f"SKIPPED: {reason} — written by another engine, so a rewrite would "
-            "fail at commit; snapshot expiry still runs",
         )
 
     # Streamed, atomic rewrite — peak memory is O(1) in table size (bounded by
@@ -570,6 +595,12 @@ class RunSummary:
 
     So it gets a number of its own, and `unsupported_tables` carries the names,
     because "1 un-compactable" is only actionable if you know which one.
+
+    The number counts a property of the tables, not of tonight's run: a table
+    is un-compactable whether or not the size gates would have elected it for a
+    rewrite. It did not always — until 2026-08-28 the manifest check sat behind
+    those gates, so lowering a threshold could take the count to zero with
+    nothing repaired.
     """
 
     tables: int = 0

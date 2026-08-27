@@ -20,9 +20,15 @@ def _set(env, **overrides):
 
 
 def test_defaults_match_chart(monkeypatch):
+    """apps/box/iceberg-maintenance/values.yaml in the FairTier monorepo.
+
+    Kept in lockstep so the image is not shipped with a default the fleet
+    overrides — a self-hoster running it bare gets what a box gets.
+    """
     _set(monkeypatch)
     cfg = load_config()
-    assert cfg.small_file_max_bytes == 32 * MIB
+    # 8 MiB, not 32 — see the note at the default in config.py.
+    assert cfg.small_file_max_bytes == 8 * MIB
     assert cfg.min_input_files == 8
     assert cfg.rewrite_min_small_fraction == 0.3
     assert cfg.rewrite_chunk_bytes == 128 * MIB

@@ -97,7 +97,11 @@ Rules that keep it honest:
   is null, so the swap's delete manifest is rejected at commit) are skipped for
   compaction but still get (metadata-only) snapshot expiry. Both gates run
   *before* the rewrite: a skip discovered at commit time costs a full
-  table rewrite into orphan parquet, every night, forever.
+  table rewrite into orphan parquet, every night, forever. The manifest gate
+  also runs *before the size gates*, so `unsupported` counts a property of the
+  table rather than of tonight's thresholds — behind them, lowering
+  `SMALL_FILE_MAX_BYTES` silently took a box's count 2 → 0 with nothing fixed
+  (`test_unrewritable_manifest_is_reported_even_when_not_a_candidate`).
 - **Direct S3 IO.** `table.io` is replaced with a direct-credential
   `PyArrowFileIO` after `load_table()` to sidestep Lakekeeper's forced
   `S3V4RestSigner` (a known PyIceberg async-s3fs bug).

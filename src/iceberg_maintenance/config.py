@@ -95,7 +95,17 @@ def load_config() -> Config:
         aws_access_key_id=_require("AWS_ACCESS_KEY_ID"),
         aws_secret_access_key=_require("AWS_SECRET_ACCESS_KEY"),
         aws_region=os.environ.get("AWS_REGION", "auto"),
-        small_file_max_bytes=int(os.environ.get("SMALL_FILE_MAX_BYTES", str(32 * MIB))),
+        # 8 MiB, not 32: this threshold judges *on-disk parquet* bytes while
+        # REWRITE_CHUNK_BYTES below bounds *in-memory Arrow* bytes, and at the
+        # ~10:1 compression of a real table a 128 MiB Arrow chunk lands as a
+        # ~13 MiB parquet file. At 32 MiB every file the rewrite produced was
+        # born "small", so the gate re-fired the next night, forever: a
+        # production box rewrote 107 files / 1.44 GiB into 107 files /
+        # 1.44 GiB nightly until 2026-08-27, orphaning the whole 1.44 GiB in
+        # object storage each time, and the fourth such night livelocked the
+        # box. Keep it below the achievable output size until the rewrite
+        # closes files on an on-disk size rather than an in-memory one.
+        small_file_max_bytes=int(os.environ.get("SMALL_FILE_MAX_BYTES", str(8 * MIB))),
         min_input_files=int(os.environ.get("MIN_INPUT_FILES", "8")),
         rewrite_min_small_fraction=float(
             os.environ.get("REWRITE_MIN_SMALL_FRACTION", "0.3")

@@ -64,6 +64,15 @@ corrupted data).
   is written, since discovering it at commit time means a whole table rewritten
   into orphan files for nothing. Snapshot expiry still runs.
 
+  The check also runs **before the size gates**, so it is asked of every table
+  and not only of the ones tonight's thresholds elected for a rewrite. Whether
+  PyIceberg can decode a table is a property of the engine that wrote it, and
+  a count that moves when you tune `SMALL_FILE_MAX_BYTES` is not measuring it:
+  lowering that threshold 32 MiB → 8 MiB on a production box took
+  `tables_unsupported` from 2 to 0 with the interop bug exactly where it was,
+  because the two affected tables (~8.5 MiB per file) stopped clearing
+  `MIN_INPUT_FILES` and returned "healthy" one gate earlier.
+
   This is not a rare edge: **every table a dbt model materializes through
   DuckDB lands this way**, so a warehouse's un-compactable share grows with its
   transformation layer, not with anything the operator did. It stayed invisible
@@ -115,7 +124,7 @@ chart). Defaults mirror that chart's `values.yaml`.
 | Variable                     | Default        | Description                                                                 |
 |------------------------------|----------------|-----------------------------------------------------------------------------|
 | `AWS_REGION`                 | `auto`         | S3 region (`auto` for Cloudflare R2)                                        |
-| `SMALL_FILE_MAX_BYTES`       | `33554432`     | A data file below this counts as "small"                                   |
+| `SMALL_FILE_MAX_BYTES`       | `8388608`      | A data file below this counts as "small". Judges *on-disk parquet* bytes while `REWRITE_CHUNK_BYTES` bounds *in-memory Arrow* bytes — keep it below the compacted output size or every rewrite re-qualifies its own output (see `config.py`) |
 | `MIN_INPUT_FILES`            | `8`            | Compact only when a table has at least this many small files               |
 | `REWRITE_MIN_SMALL_FRACTION` | `0.3`          | Write-amplification gate: rewrite only when small files are ≥ this fraction of the table by bytes |
 | `REWRITE_CHUNK_BYTES`        | `134217728`    | Streaming chunk size — the **only** thing that sets peak rewrite memory (constant in table size), and the approximate output data-file size |
@@ -151,6 +160,9 @@ Three things about it are deliberate:
 compaction can never run on as things stand — delete files, or manifests
 PyIceberg cannot decode — as distinct from the `skipped` outcome, which is the
 write-amplification gate declining a healthy table and is normal every night.
+Because the manifest check runs ahead of the size gates, the number answers
+"how much of this warehouse can compaction never repair", not "how much of it
+did tonight's thresholds happen to look at".
 Snapshot expiry still runs on unsupported tables, which is exactly why they
 look fine from the outside: one production box carried an un-compactable dbt
 staging table for weeks while every run reported "12 tables scanned, 0 errors"
