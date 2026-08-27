@@ -59,6 +59,8 @@ class Config:
     min_input_files: int
     rewrite_min_small_fraction: float
     rewrite_chunk_bytes: int
+    commit_max_attempts: int
+    commit_retry_backoff_seconds: float
 
     # --- Snapshot-expiry knobs (the customer-visible time-travel window) ---
     max_snapshot_age_ms: int
@@ -111,6 +113,22 @@ def load_config() -> Config:
             os.environ.get("REWRITE_MIN_SMALL_FRACTION", "0.3")
         ),
         rewrite_chunk_bytes=int(os.environ.get("REWRITE_CHUNK_BYTES", str(128 * MIB))),
+        # How many times to offer the finished rewrite to a catalog that is
+        # merely unavailable, and the first backoff (doubling: 15s, 30s, 60s,
+        # 120s — ~3.75 min of patience across the default 5 attempts).
+        #
+        # Bounded, and deliberately modest: this buys back a Lakekeeper *pod
+        # restart*, which is what the failure usually is. It cannot buy back a
+        # 45-minute crashloop, and it should not try — concurrencyPolicy is
+        # Forbid, so a run that waits forever eats the following nights too.
+        # The asymmetry is what justifies any wait at all: the rewrite is 20
+        # minutes of streaming and the commit is one HTTP call, so throwing the
+        # first away because the second was refused for 15 seconds is the worst
+        # possible trade.
+        commit_max_attempts=int(os.environ.get("COMMIT_MAX_ATTEMPTS", "5")),
+        commit_retry_backoff_seconds=float(
+            os.environ.get("COMMIT_RETRY_BACKOFF_SECONDS", "15")
+        ),
         max_snapshot_age_ms=int(
             os.environ.get("MAX_SNAPSHOT_AGE_MS", str(7 * 24 * 3600 * 1000))
         ),

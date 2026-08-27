@@ -189,7 +189,7 @@ wheels = [
 
 [[package]]
 name = "iceberg-maintenance"
-version = "0.6.0"
+version = "0.7.0"
 source = { editable = "." }
 dependencies = [
     { name = "opentelemetry-api" },
@@ -198,6 +198,7 @@ dependencies = [
     { name = "opentelemetry-sdk" },
     { name = "pyarrow" },
     { name = "pyiceberg", extra = ["pyarrow"] },
+    { name = "requests" },
 ]
 
 [package.dev-dependencies]
@@ -216,6 +217,7 @@ requires-dist = [
     { name = "opentelemetry-sdk", specifier = ">=1.30" },
     { name = "pyarrow" },
     { name = "pyiceberg", extras = ["pyarrow"], specifier = "==0.11.1" },
+    { name = "requests" },
 ]
 
 [package.metadata.requires-dev]

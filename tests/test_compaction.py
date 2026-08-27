@@ -10,7 +10,9 @@ The warehouse fixture and the config factory live in conftest.py.
 """
 
 import pytest
+import requests
 from conftest import FILES, ROWS_PER_FILE
+from pyiceberg.exceptions import CommitFailedException, CommitStateUnknownException
 
 from iceberg_maintenance.maintenance import (
     compact_table,
@@ -175,3 +177,138 @@ def test_unrewritable_manifest_is_reported_even_when_not_a_candidate(
 
 def test_healthy_manifests_are_not_reported_unrewritable(table):
     assert unrewritable_manifest_reason(table, table.current_snapshot()) is None
+
+
+def _flaky_commit(
+    monkeypatch, fail_times, *, apply_anyway=False, exc=None, before=None
+):
+    """Make the catalog fail the first `fail_times` commits of the swap.
+
+    `apply_anyway` applies the commit before raising — the ambiguous case a
+    5xx on the commit endpoint leaves behind (the write landed, the response
+    did not). `before` runs just before the raise, to let another writer in.
+    """
+    from pyiceberg.catalog.memory import InMemoryCatalog
+
+    original = InMemoryCatalog.commit_table
+    state = {"calls": 0, "armed": False}
+
+    def flaky(self, table, requirements, updates):
+        if not state["armed"] or state["calls"] >= fail_times:
+            return original(self, table, requirements, updates)
+        state["calls"] += 1
+        if apply_anyway:
+            original(self, table, requirements, updates)
+        if before is not None:
+            before()
+        raise (exc or requests.exceptions.ConnectionError("catalog gone"))
+
+    monkeypatch.setattr(InMemoryCatalog, "commit_table", flaky)
+    return state
+
+
+def test_commit_is_retried_when_the_catalog_is_unavailable(table, cfg, monkeypatch):
+    """The regression guard for the 2026-08-27 loss.
+
+    A completed rewrite is minutes of streaming and gigabytes through object
+    storage; the commit is one HTTP call. Throwing the first away because the
+    second was refused turns a blip into a night of orphans.
+    """
+    before = _rows(table)
+    state = _flaky_commit(monkeypatch, fail_times=2)
+    state["armed"] = True
+
+    outcome = compact_table(table, table.io, cfg(commit_max_attempts=5))
+
+    assert outcome.kind == "compacted", outcome
+    assert state["calls"] == 2
+    table.refresh()
+    assert len(_data_files(table)) < FILES
+    assert _rows(table) == before
+
+
+def test_commit_gives_up_after_the_attempt_budget(table, cfg, monkeypatch):
+    """Bounded, not infinite: concurrencyPolicy is Forbid, so a pinned run
+    would eat the following nights too."""
+    state = _flaky_commit(monkeypatch, fail_times=99)
+    state["armed"] = True
+
+    with pytest.raises(requests.exceptions.ConnectionError):
+        compact_table(table, table.io, cfg(commit_max_attempts=3))
+
+    assert state["calls"] == 3
+    table.refresh()
+    assert len(_data_files(table)) == FILES  # untouched
+
+
+def test_a_lost_commit_race_is_not_retried(table, cfg, monkeypatch):
+    """A concurrent writer advanced the branch: the rewrite is stale by
+    definition, so yield rather than insist."""
+    state = _flaky_commit(
+        monkeypatch, fail_times=99, exc=CommitFailedException("someone else won")
+    )
+    state["armed"] = True
+
+    with pytest.raises(CommitFailedException):
+        compact_table(table, table.io, cfg(commit_max_attempts=5))
+
+    assert state["calls"] == 1
+
+
+def test_a_landed_commit_is_not_committed_twice(table, cfg, monkeypatch):
+    """500/502/504 on the commit endpoint says "state unknown", not "failed".
+
+    The write may have been applied and only the response lost, so the retry
+    re-reads the table instead of taking the exception at its word — otherwise
+    it mints a second, identical snapshot for nothing.
+    """
+    before = _rows(table)
+    state = _flaky_commit(
+        monkeypatch,
+        fail_times=1,
+        apply_anyway=True,
+        exc=CommitStateUnknownException("504 from the catalog"),
+    )
+    state["armed"] = True
+
+    outcome = compact_table(table, table.io, cfg(commit_max_attempts=5))
+
+    assert outcome.kind == "compacted", outcome
+    assert state["calls"] == 1
+    table.refresh()
+    snapshots_after_the_swap = [
+        s
+        for s in table.metadata.snapshots
+        if s.snapshot_id == table.metadata.current_snapshot_id
+    ]
+    assert len(snapshots_after_the_swap) == 1
+    assert len(_data_files(table)) < FILES
+    assert _rows(table) == before
+
+
+def test_a_concurrent_write_during_the_retry_is_not_clobbered(table, cfg, monkeypatch):
+    """The hazard the retry introduces, and must not fall into.
+
+    The swap is `delete(ALWAYS_TRUE) + append(our files)` — safe only against
+    the snapshot it was planned on. Refreshing onto a snapshot somebody *else*
+    produced would make that delete succeed and silently drop their rows.
+    """
+    import pyarrow
+
+    def concurrent_append():
+        other = table.catalog.load_table(table.name())
+        other.append(
+            pyarrow.table(
+                {"id": [999_999], "payload": ["written-by-someone-else"]},
+                schema=other.schema().as_arrow(),
+            )
+        )
+
+    state = _flaky_commit(monkeypatch, fail_times=1, before=concurrent_append)
+    state["armed"] = True
+
+    with pytest.raises(CommitFailedException, match="stale"):
+        compact_table(table, table.io, cfg(commit_max_attempts=5))
+
+    table.refresh()
+    assert 999_999 in _rows(table)["id"]

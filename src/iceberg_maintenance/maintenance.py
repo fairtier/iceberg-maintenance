@@ -12,7 +12,9 @@ Walks every table in the warehouse and
 
 Safe against concurrent dlt loads: Iceberg's optimistic concurrency turns a
 clash into a failed commit here (logged, retried next night), never corrupted
-data.
+data. A catalog that is merely *unavailable* is a different thing and is
+retried on the spot rather than costing the whole rewrite behind it — see
+commit_swap.
 
 Every per-table operation reports an `Outcome` — a label a metric can count
 plus the sentence a human reads — and the whole run is one trace when a
@@ -47,9 +49,15 @@ from dataclasses import dataclass, field
 from functools import partial
 
 import pyarrow
+import requests
 from opentelemetry.trace import Span, StatusCode
 from pyiceberg.catalog import load_catalog
-from pyiceberg.exceptions import CommitFailedException
+from pyiceberg.exceptions import (
+    CommitFailedException,
+    CommitStateUnknownException,
+    ServerError,
+    ServiceUnavailableError,
+)
 from pyiceberg.expressions import AlwaysTrue
 
 # NOTE: `_dataframe_to_data_files` and `_record_batches_from_scan_tasks_and_deletes`
@@ -250,6 +258,133 @@ def unrewritable_manifest_reason(table, snapshot) -> str | None:
                     f"({manifest.manifest_path.rsplit('/', 1)[-1]})"
                 )
     return None
+
+
+# Commit failures that mean "the catalog was not there", as opposed to "someone
+# else got there first" (CommitFailedException — yield, retry tomorrow) or "this
+# request is wrong" (4xx — retrying changes nothing).
+_UNAVAILABLE_CATALOG = (
+    # Nothing answered. Lakekeeper crashlooping, CoreDNS restarted, the box
+    # mid-recovery — the 2026-08-27 failure verbatim ("Connection refused"),
+    # which threw away a completed 1.4 GiB rewrite.
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    # 503: up, not serving yet.
+    ServiceUnavailableError,
+    # Other 5xx.
+    ServerError,
+    # 500/502/504 on the commit endpoint specifically. AMBIGUOUS BY
+    # CONSTRUCTION: PyIceberg raises this exact type to say the commit may or
+    # may not have been applied, which is why the retry re-reads the table
+    # before believing anything.
+    CommitStateUnknownException,
+)
+
+
+def _swap_already_landed(table, data_files) -> bool:
+    """Is the table's live file set exactly the one this rewrite wrote?
+
+    The question a lost response leaves behind. If the answer is yes, the
+    commit we never heard back from was applied and there is nothing to redo;
+    retrying it would only mint a second, identical snapshot.
+
+    Path equality, not a snapshot-id or row count: the data files are the swap,
+    and comparing them is the only check that cannot be fooled by a concurrent
+    writer that happens to have produced the same number of rows.
+    """
+    written = {data_file.file_path for data_file in data_files}
+    live = {task.file.file_path for task in table.scan().plan_files()}
+    return live == written
+
+
+def commit_swap(table, data_files, base_snapshot_id: int, cfg: Config) -> int:
+    """Commit the rewrite; retry a catalog that is merely unavailable.
+
+    Returns the attempt number that succeeded, so the caller can say so.
+
+    The asymmetry this exists for: the rewrite above is the expensive half
+    (minutes of streaming, gigabytes through object storage) and the commit is
+    one HTTP call. On 2026-08-27 a box lost a completed 1.4 GiB rewrite of
+    `nyc_taxi.yellow_trips` — all 107 chunks written — to a single
+    `Connection refused` while Lakekeeper was crashlooping, and turned the
+    whole thing into 1.4 GiB of orphans that no OSS tool can sweep. Redoing
+    that tomorrow costs strictly more than waiting a couple of minutes today.
+
+    Two things it refuses to do, both of which would be worse than the loss it
+    prevents:
+
+    - **It does not retry a lost race.** `CommitFailedException` means a
+      concurrent dlt load advanced the branch; the rewrite is stale by
+      definition and yielding is correct (the caller reports `conflict` and
+      the next night retries).
+    - **It does not re-aim the swap at a table that moved.** The swap is
+      `delete(ALWAYS_TRUE) + append(our files)`, which is only safe against the
+      snapshot it was planned on. Refreshing onto a snapshot a *concurrent*
+      writer produced would make that delete succeed — and silently drop their
+      rows. So a refresh that finds an unfamiliar snapshot ends the attempt as
+      a conflict, exactly as the un-retried commit would have.
+
+    (If our own swap landed and a concurrent write followed it, the file sets
+    no longer match and this reports a conflict for work that in fact
+    succeeded. Harmless — the table is correct, and the next run sees it.)
+    """
+    last: Exception | None = None
+    for attempt in range(1, max(cfg.commit_max_attempts, 1) + 1):
+        try:
+            with table.transaction() as tx:
+                tx.delete(delete_filter=AlwaysTrue())
+                with tx._append_snapshot_producer({}) as append_files:
+                    for data_file in data_files:
+                        append_files.append_data_file(data_file)
+            return attempt
+        except CommitFailedException:
+            raise
+        except _UNAVAILABLE_CATALOG as exc:
+            last = exc
+            if attempt >= max(cfg.commit_max_attempts, 1):
+                break
+            delay = cfg.commit_retry_backoff_seconds * 2 ** (attempt - 1)
+            log.warning(
+                "%s: commit attempt %d/%d failed (%s: %s) — retrying in %.0fs",
+                ".".join(table.name()),
+                attempt,
+                cfg.commit_max_attempts,
+                type(exc).__name__,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+            try:
+                table.refresh()
+            except _UNAVAILABLE_CATALOG as refresh_exc:
+                # Still down. Nothing to learn from the table yet — go straight
+                # to the next attempt, which will fail the same way and sleep
+                # longer.
+                log.info(
+                    "%s: refresh after attempt %d also failed (%s) — retrying anyway",
+                    ".".join(table.name()),
+                    attempt,
+                    type(refresh_exc).__name__,
+                )
+                continue
+            current = table.current_snapshot()
+            if current is not None and current.snapshot_id != base_snapshot_id:
+                if _swap_already_landed(table, data_files):
+                    log.info(
+                        "%s: commit had landed after all (attempt %d) — "
+                        "the response was lost, not the write",
+                        ".".join(table.name()),
+                        attempt,
+                    )
+                    return attempt
+                raise CommitFailedException(
+                    "table advanced to snapshot "
+                    f"{current.snapshot_id} while the commit was being retried "
+                    "— the rewrite is stale, yielding to the concurrent writer"
+                ) from exc
+    if last is None:  # unreachable: the loop runs at least once
+        raise RuntimeError("commit_swap made no attempt")
+    raise last
 
 
 def compact_table(table, s3_io, cfg: Config) -> Outcome:
@@ -480,14 +615,13 @@ def _compact_table(span: Span, table, s3_io, cfg: Config) -> Outcome:
     # here also leaves the table untouched. A concurrent dlt load that advanced
     # the branch loses the commit race (CommitFailedException, caught by the
     # caller and retried next night), exactly as the stock overwrite would.
-    with (
-        tracer.start_as_current_span("iceberg.compact.commit"),
-        table.transaction() as tx,
-    ):
-        tx.delete(delete_filter=AlwaysTrue())
-        with tx._append_snapshot_producer({}) as append_files:
-            for data_file in data_files:
-                append_files.append_data_file(data_file)
+    #
+    # An *unavailable* catalog is not that, and is retried rather than thrown
+    # away with the whole rewrite behind it — see commit_swap.
+    with tracer.start_as_current_span("iceberg.compact.commit") as commit_span:
+        attempts = commit_swap(table, data_files, snapshot.snapshot_id, cfg)
+        commit_span.set_attribute("iceberg.compaction.commit.attempts", attempts)
+    span.set_attribute("iceberg.compaction.commit.attempts", attempts)
 
     # Counted only now: everything above this line is work that a lost commit
     # race turns into orphan parquet, and a "files rewritten" chart that

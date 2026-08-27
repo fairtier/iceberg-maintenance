@@ -91,6 +91,14 @@ Rules that keep it honest:
 - **Atomic swap.** The old-files delete and new-files append commit in a single
   transaction; a crash before commit leaves the table completely untouched
   (only orphan parquet in storage, which the orphan-sweep follow-up handles).
+- **An unavailable catalog is retried; a lost race is not.** `commit_swap`
+  re-offers the finished rewrite to a catalog that did not answer (connection
+  error, 5xx) because the rewrite is the expensive half and the commit is one
+  HTTP call. It must never retry a `CommitFailedException`, and must never
+  rebase the swap onto a snapshot a concurrent writer produced — the swap is
+  `delete(ALWAYS_TRUE) + append`, so that would drop their rows
+  (`test_a_concurrent_write_during_the_retry_is_not_clobbered`). On a
+  state-unknown 5xx it re-reads the table before believing the commit failed.
 - **Safe skips, checked before any write.** Tables with delete files
   (merge-on-read) and tables whose manifest entries PyIceberg mis-decodes
   (DuckDB's Iceberg writer — `status` holds the snapshot id, `sequence_number`

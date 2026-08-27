@@ -1,6 +1,6 @@
 [project]
 name = "iceberg-maintenance"
-version = "0.6.0"
+version = "0.7.0"
 description = "Nightly Iceberg table maintenance (small-file compaction + snapshot expiry) for a FairTier box warehouse"
 readme = "README.md"
 license = "Apache-2.0"
@@ -17,6 +17,11 @@ dependencies = [
     # above; declared here because we import it by name. Left unpinned so uv
     # resolves it inside pyiceberg's own constraint.
     "pyarrow",
+    # Imported by name in maintenance.py, for the two transport exceptions a
+    # commit against an unreachable catalog raises (pyiceberg's REST catalog
+    # lets them through unwrapped). Provided transitively by pyiceberg above;
+    # left unpinned so uv resolves it inside pyiceberg's own constraint.
+    "requests",
     # Observability (src/iceberg_maintenance/telemetry.py). Only the API is
     # imported at module scope; the SDK, the exporter and the requests
     # instrumentation are imported lazily and only on a box that has a

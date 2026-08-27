@@ -37,6 +37,9 @@ _BASE = Config(
     min_input_files=4,
     rewrite_min_small_fraction=0.0,
     rewrite_chunk_bytes=32 * MIB,
+    commit_max_attempts=1,
+    # 0: the retry tests bend attempts up and must not actually wait.
+    commit_retry_backoff_seconds=0.0,
     max_snapshot_age_ms=7 * 24 * 3600 * 1000,
     min_snapshots_to_keep=5,
 )

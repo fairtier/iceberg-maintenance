@@ -45,6 +45,19 @@ one table never blocks the others, and a commit lost to a concurrent dlt load
 is logged and retried next run (Iceberg optimistic concurrency — never
 corrupted data).
 
+> **A commit refused because the catalog is down is retried on the spot**
+> (`COMMIT_MAX_ATTEMPTS`, exponential backoff). The rewrite is minutes of
+> streaming and gigabytes through object storage; the commit is one HTTP call.
+> A box lost a finished 1.4 GiB rewrite to a single `Connection refused` while
+> Lakekeeper was crashlooping, and it became 1.4 GiB of orphans no OSS tool can
+> sweep. Two things the retry will not do: retry a **lost race**
+> (`CommitFailedException` — the rewrite is stale, yield), or re-aim the swap
+> at a snapshot a **concurrent writer** produced (the swap is
+> `delete(ALWAYS_TRUE) + append`, and rebasing it onto someone else's snapshot
+> would silently drop their rows). A `500`/`502`/`504` says *state unknown*, so
+> the retry re-reads the table first: if the swap landed and only the response
+> was lost, it stops there rather than minting a second identical snapshot.
+
 ### Deliberately not handled
 
 - **Orphan-file removal** — no OSS option exists (Lakekeeper's queue is
@@ -127,6 +140,8 @@ chart). Defaults mirror that chart's `values.yaml`.
 | `SMALL_FILE_MAX_BYTES`       | `8388608`      | A data file below this counts as "small". Judges *on-disk parquet* bytes while `REWRITE_CHUNK_BYTES` bounds *in-memory Arrow* bytes — keep it below the compacted output size or every rewrite re-qualifies its own output (see `config.py`) |
 | `MIN_INPUT_FILES`            | `8`            | Compact only when a table has at least this many small files               |
 | `REWRITE_MIN_SMALL_FRACTION` | `0.3`          | Write-amplification gate: rewrite only when small files are ≥ this fraction of the table by bytes |
+| `COMMIT_MAX_ATTEMPTS`        | `5`            | Offers of the finished rewrite to an *unavailable* catalog before giving up. A lost commit race is never retried |
+| `COMMIT_RETRY_BACKOFF_SECONDS` | `15`         | First backoff between those attempts; doubles (15s, 30s, 60s, 120s) |
 | `REWRITE_CHUNK_BYTES`        | `134217728`    | Streaming chunk size — the **only** thing that sets peak rewrite memory (constant in table size), and the approximate output data-file size |
 | `MAX_SNAPSHOT_AGE_MS`        | `604800000`    | Time-travel window; snapshots older than this are expired (7 days)         |
 | `MIN_SNAPSHOTS_TO_KEEP`      | `5`            | Retention floor: always keep the newest N snapshots regardless of age      |
