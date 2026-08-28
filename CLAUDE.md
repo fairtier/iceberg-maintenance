@@ -47,6 +47,7 @@ src/iceberg_maintenance/
   config.py         # environment-variable configuration (Config dataclass)
   maintenance.py    # compaction + snapshot expiry logic and the main loop
   orphans.py        # orphan-file sweep — the only code here that DELETES
+  verify.py         # read-only pre-arming proof (python -m iceberg_maintenance.verify)
   telemetry.py      # OpenTelemetry setup + the instruments maintenance.py uses
 tests/              # pytest suite (conftest.py holds the local-warehouse fixture)
 ```
@@ -105,6 +106,16 @@ Rules that keep it honest:
   `test_a_retained_snapshots_files_survive_a_compaction`), and never let a
   partially-read manifest reach the delete list
   (`test_an_unreadable_manifest_deletes_nothing`).
+- **The verifier never deletes, and never passes vacuously.** A box is armed on
+  the strength of `verify.py`, so it calls `find_orphans` and never
+  `sweep_table` — `ORPHAN_SWEEP_MODE=delete` must not leak into it
+  (`test_verify_deletes_nothing_even_when_armed`) — and it must FAIL when the
+  orphan set intersects the live set
+  (`test_a_live_file_in_the_orphan_set_fails`), or it proves nothing. Its
+  read-back skips to the oldest snapshot that actually plans files (an oldest
+  retained snapshot can be a truncate, which makes "the oldest snapshot
+  survived" vacuous) and counts rows through `stream_batches`, never
+  `scan().to_arrow()`.
 - **An unavailable catalog is retried; a lost race is not.** `commit_swap`
   re-offers the finished rewrite to a catalog that did not answer (connection
   error, 5xx) because the rewrite is the expensive half and the commit is one

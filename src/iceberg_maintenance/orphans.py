@@ -120,6 +120,17 @@ def normalize(io, location: str) -> str:
     return _SLASHES.sub("/", path).strip("/")
 
 
+def normalize_listed(path: str) -> str:
+    """Fold a *listing's* own path the way `normalize` folds a location.
+
+    A listing already hands back the filesystem-native spelling (`bucket/key`),
+    so there is no scheme to strip — only the slash-squeezing and trimming, and
+    it has to be exactly the same squeezing or a live file compares unequal to
+    its own reference and looks like garbage.
+    """
+    return _SLASHES.sub("/", path).strip("/")
+
+
 def referenced_files(table, io) -> set[str]:
     """Every file any retained snapshot of this table can still reach.
 
@@ -215,7 +226,7 @@ def find_orphans(table, io, cfg: Config, now: float | None = None):
         if info.type != FileType.File:
             continue
         listed += 1
-        if _SLASHES.sub("/", info.path).strip("/") in refs:
+        if normalize_listed(info.path) in refs:
             continue
         # No mtime is not evidence of age. Skip it and let a later run, which
         # may know better, decide.

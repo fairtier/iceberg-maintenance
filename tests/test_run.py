@@ -106,11 +106,13 @@ def test_a_declined_rewrite_is_not_counted_as_uncompactable(
     assert (summary.errors, summary.unsupported) == (0, 0)
 
 
-def test_the_textfile_is_written_atomically_and_readably(tmp_path):
+def test_the_textfile_is_written_atomically_and_readably(tmp_path, cfg):
     path = tmp_path / "sub" / "iceberg_maintenance.prom"
 
     maintenance.write_textfile(
-        str(path), RunSummary(tables=12, unsupported_tables=["staging.stg_trips"])
+        str(path),
+        RunSummary(tables=12, unsupported_tables=["staging.stg_trips"]),
+        cfg(),
     )
 
     body = path.read_text()
@@ -140,3 +142,62 @@ def test_a_failed_run_leaves_the_previous_heartbeat_standing(
 
     assert maintenance.main() == 1
     assert not (tmp_path / "m.prom").exists()
+
+
+def test_the_textfile_says_whether_the_sweep_is_armed(tmp_path, cfg):
+    """`armed` is what separates "not draining" from "not armed".
+
+    Both look identical in `iceberg_maintenance_orphan_bytes` — a flat, large
+    backlog — and only one of them is a fault. Without this flag the fleet
+    alert on a standing backlog would fire forever on every box that has
+    (correctly) not been armed yet.
+    """
+    dry = tmp_path / "dry.prom"
+    armed = tmp_path / "armed.prom"
+    summary = RunSummary(tables=3, orphan_files=40186, orphan_bytes=73_500_000_000)
+
+    maintenance.write_textfile(str(dry), summary, cfg(orphan_sweep_mode="dry-run"))
+    maintenance.write_textfile(str(armed), summary, cfg(orphan_sweep_mode="delete"))
+
+    assert "iceberg_maintenance_orphan_sweep_armed 0" in dry.read_text()
+    assert "iceberg_maintenance_orphan_sweep_armed 1" in armed.read_text()
+
+
+def test_the_textfile_publishes_what_the_sweep_deleted_and_refused(tmp_path, cfg):
+    """Deleted separates "capped but working" from "working on nothing".
+
+    Refused is the sweep's silent-failure shape: a refused table contributes
+    zero orphans, so the backlog figure FALLS when the sweep stops working —
+    the one way the alert above could be talked out of firing.
+    """
+    path = tmp_path / "m.prom"
+
+    maintenance.write_textfile(
+        str(path),
+        RunSummary(
+            tables=15,
+            orphan_files=40186,
+            orphan_bytes=73_500_000_000,
+            orphan_deleted=5000,
+            orphan_refused_tables=["marts.fct_trips"],
+        ),
+        cfg(orphan_sweep_mode="delete"),
+    )
+
+    body = path.read_text()
+    assert "iceberg_maintenance_orphan_files_deleted 5000" in body
+    assert "iceberg_maintenance_orphan_sweep_refused 1" in body
+
+
+def test_a_refused_sweep_is_counted_and_named(table, cfg, warehouse, monkeypatch):
+    """A refusal is not an error, and must not disappear like one either."""
+
+    def refuse(*args, **kwargs):
+        raise maintenance.orphans.SweepRefused("no referenced files found")
+
+    monkeypatch.setattr(maintenance.orphans, "find_orphans", refuse)
+
+    summary = maintain_warehouse(warehouse, table.io, cfg(orphan_sweep_mode="delete"))
+
+    assert summary.errors == 0
+    assert summary.orphan_refused_tables == ["ns.small_files"]

@@ -745,6 +745,15 @@ def run_sweep(name, table, s3_io, cfg: Config, summary: "RunSummary") -> Outcome
     summary.orphan_files += result.files
     summary.orphan_bytes += result.bytes
     summary.orphan_deleted += result.deleted
+    # A refused table is the sweep's own silent-failure shape. It is not an
+    # error (refusing is the correct, conservative answer to a manifest that
+    # will not parse or a location that looks like a bucket root), and the run
+    # goes on — but it reports *zero* orphans for that table, which makes the
+    # backlog metric go DOWN when the sweep stops working. Counting it is what
+    # keeps `iceberg_maintenance_orphan_bytes` honest; the same lesson as the
+    # un-compactable count, one module over.
+    if outcome.kind == "skipped":
+        summary.orphan_refused_tables.append(name)
     return outcome
 
 
@@ -782,10 +791,17 @@ class RunSummary:
     orphan_files: int = 0
     orphan_bytes: int = 0
     orphan_deleted: int = 0
+    # Tables whose sweep refused to run at all (see run_sweep). Named, not
+    # just counted, for the same reason `unsupported_tables` is.
+    orphan_refused_tables: list[str] = field(default_factory=list)
 
     @property
     def unsupported(self) -> int:
         return len(self.unsupported_tables)
+
+    @property
+    def orphan_refused(self) -> int:
+        return len(self.orphan_refused_tables)
 
 
 def maintain_warehouse(catalog, s3_io, cfg: Config) -> RunSummary:
@@ -861,7 +877,7 @@ def maintain_warehouse(catalog, s3_io, cfg: Config) -> RunSummary:
     return summary
 
 
-def write_textfile(path: str, summary: RunSummary) -> None:
+def write_textfile(path: str, summary: RunSummary, cfg: Config) -> None:
     """Publish the run's numbers as a node_exporter textfile.
 
     Called only after a clean run (`errors == 0`) — the timestamp means "the
@@ -879,6 +895,14 @@ def write_textfile(path: str, summary: RunSummary) -> None:
     point of that count is that it is invisible in the exit code. The orphan
     figures are the same shape of fact — a warehouse can be maintained
     perfectly and still be paying for gigabytes nothing references.
+
+    Three of these describe the *sweep* rather than the warehouse, and they
+    exist because a backlog number alone cannot be alerted on. Whether the box
+    is armed separates "not draining" from "not armed" (which is a decision,
+    not a fault); what the run deleted separates "capped, still working" from
+    "working on nothing"; and refusals are the one way the backlog figure can
+    fall while the storage does not. See BoxIcebergOrphanBacklogStuck in the
+    platform repo's infra/platform/observability.tf.
     """
     directory = os.path.dirname(path) or "."
     tmp = f"{path}.tmp"
@@ -905,6 +929,22 @@ def write_textfile(path: str, summary: RunSummary) -> None:
         "unreachable files — what the warehouse pays for and nothing reads.\n"
         "# TYPE iceberg_maintenance_orphan_bytes gauge\n"
         f"iceberg_maintenance_orphan_bytes {summary.orphan_bytes}\n"
+        "# HELP iceberg_maintenance_orphan_files_deleted Unreachable files the "
+        "last clean run actually removed. Zero in dry-run mode by design.\n"
+        "# TYPE iceberg_maintenance_orphan_files_deleted gauge\n"
+        f"iceberg_maintenance_orphan_files_deleted {summary.orphan_deleted}\n"
+        "# HELP iceberg_maintenance_orphan_sweep_armed 1 when the sweep is armed "
+        "to delete on this box, 0 when it only reports. Arming is a per-box "
+        "decision taken after a live-set proof.\n"
+        "# TYPE iceberg_maintenance_orphan_sweep_armed gauge\n"
+        f"iceberg_maintenance_orphan_sweep_armed "
+        f"{int(cfg.orphan_sweep_mode == orphans.MODE_DELETE)}\n"
+        "# HELP iceberg_maintenance_orphan_sweep_refused Tables whose orphan "
+        "sweep refused to run (unreadable manifest, empty reference set, "
+        "suspicious location). They report zero orphans, so the backlog figure "
+        "understates by however much they hold.\n"
+        "# TYPE iceberg_maintenance_orphan_sweep_refused gauge\n"
+        f"iceberg_maintenance_orphan_sweep_refused {summary.orphan_refused}\n"
     )
     os.makedirs(directory, exist_ok=True)
     with open(tmp, "w") as fh:
@@ -946,12 +986,13 @@ def main() -> int:
                     "iceberg.orphans.files": summary.orphan_files,
                     "iceberg.orphans.bytes": summary.orphan_bytes,
                     "iceberg.orphans.deleted": summary.orphan_deleted,
+                    "iceberg.orphans.refused": summary.orphan_refused,
                     "iceberg.outcome": run_outcome,
                 }
             )
             log.info(
                 "done: %d tables scanned, %d errors, %d un-compactable%s, "
-                "%d orphan file(s) / %.1f MiB unreachable (%d deleted, mode=%s)",
+                "%d orphan file(s) / %.1f MiB unreachable (%d deleted, mode=%s)%s",
                 summary.tables,
                 summary.errors,
                 summary.unsupported,
@@ -962,6 +1003,9 @@ def main() -> int:
                 summary.orphan_bytes / MIB,
                 summary.orphan_deleted,
                 cfg.orphan_sweep_mode,
+                f", sweep REFUSED on {', '.join(summary.orphan_refused_tables)}"
+                if summary.orphan_refused_tables
+                else "",
             )
             if summary.errors:
                 return 1
@@ -970,7 +1014,7 @@ def main() -> int:
                 # not be reported as a failed run because a hostPath was not
                 # mounted. The staleness alert covers a heartbeat that stops.
                 try:
-                    write_textfile(cfg.textfile_path, summary)
+                    write_textfile(cfg.textfile_path, summary, cfg)
                 except Exception:
                     log.exception("could not write %s", cfg.textfile_path)
             return 0

@@ -96,11 +96,42 @@ else is JVM — so `orphans.py` does it, written as a set of refusals:
   bites — a silent cap reads as "swept clean" when it is not.
 - **Off unless armed.** The default is `dry-run`: it measures and reports.
   `ORPHAN_SWEEP_MODE=delete` is a deliberate, per-deployment decision taken
-  after a run's report has been read.
+  after a run's report has been read **and the live set has been checked
+  against it on that deployment** — see the verifier below.
 
 Even in `dry-run` the numbers are worth having on their own — until this
 existed, nothing anywhere said how much orphaned parquet a warehouse was
 paying for.
+
+### The verifier — `python -m iceberg_maintenance.verify`
+
+Arming is per warehouse, so the proof has to be per warehouse: that on *these*
+objects, the files nothing references and the files everything reads are two
+disjoint sets. A warehouse written by an engine we have not met is not covered
+by another one's proof — DuckDB's Iceberg writer already decodes differently
+enough to make compaction unsafe on the tables it wrote.
+
+`verify.py` is that proof, and it is **read-only by construction**: it calls
+`find_orphans`, never `sweep_table`, so no value of `ORPHAN_SWEEP_MODE` —
+including `delete` — makes it remove anything.
+
+```bash
+python -m iceberg_maintenance.verify [--table ns.name ...] [--read-back]
+```
+
+Per table it asserts that the live data files are all referenced, that none of
+them is in the orphan set, and that the current `metadata.json`, manifest list
+and manifests are not either; it prints the listed/referenced/orphan counts
+with the bytes split by prefix, and exits **1** if anything failed or the sweep
+refused. `--read-back` additionally reads the table at HEAD and at the oldest
+snapshot **that actually has data** — the oldest retained snapshot can be a
+truncate that plans zero files, which makes "the oldest snapshot survived" a
+vacuous pass — checking every planned file still exists, and counting rows
+through `stream_batches` rather than `scan().to_arrow()` (which is an OOM, not
+a read-back).
+
+Run it before arming a deployment, and again after that deployment's first
+armed run.
 
 ### Deliberately not handled
 
@@ -194,7 +225,7 @@ chart). Defaults mirror that chart's `values.yaml`.
 
 OTLP below is the richer signal, but it needs a collector on the far end. Set
 `TEXTFILE_PATH=/textfile/iceberg_maintenance.prom` and a **clean** run also
-writes five gauges to a file the box's existing node exporter already scrapes:
+writes eight gauges to a file the box's existing node exporter already scrapes:
 
 | Metric | Meaning |
 |---|---|
@@ -203,6 +234,16 @@ writes five gauges to a file the box's existing node exporter already scrapes:
 | `iceberg_maintenance_tables_unsupported` | Tables it **could not compact at all** |
 | `iceberg_maintenance_orphan_files` | Files no retained snapshot can reach |
 | `iceberg_maintenance_orphan_bytes` | Object storage those files hold — reported whether or not the sweep is armed to delete them |
+| `iceberg_maintenance_orphan_files_deleted` | What the run actually removed (0 in `dry-run`, by design) |
+| `iceberg_maintenance_orphan_sweep_armed` | 1 when `ORPHAN_SWEEP_MODE=delete` |
+| `iceberg_maintenance_orphan_sweep_refused` | Tables whose sweep refused to run |
+
+The last three exist so a backlog can be alerted on at all. A large, flat
+`orphan_bytes` is either a fault or a deployment that has (correctly) not been
+armed yet, and only `orphan_sweep_armed` tells them apart; `orphan_files_deleted`
+separates "capped but draining" from "deleting nothing"; and `orphan_sweep_refused`
+is the honesty check on the other two, because a refused table reports **zero**
+orphans — so the backlog figure falls when the sweep stops working.
 
 Three things about it are deliberate:
 
