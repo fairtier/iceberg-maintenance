@@ -1,7 +1,7 @@
 [project]
 name = "iceberg-maintenance"
-version = "0.7.0"
-description = "Nightly Iceberg table maintenance (small-file compaction + snapshot expiry) for a FairTier box warehouse"
+version = "0.8.0"
+description = "Nightly Iceberg table maintenance (small-file compaction, snapshot expiry, orphan-file sweep) for a FairTier box warehouse"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"

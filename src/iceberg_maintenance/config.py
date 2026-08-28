@@ -19,6 +19,18 @@ def _require(name: str) -> str:
     return value
 
 
+def _one_of(name: str, default: str, allowed: tuple[str, ...]) -> str:
+    """Read an enum-valued variable, failing fast on a typo.
+
+    A misspelled mode must not silently pick a default — for ORPHAN_SWEEP_MODE
+    that would be the difference between deleting and not deleting.
+    """
+    value = os.environ.get(name, default).strip()
+    if value not in allowed:
+        raise SystemExit(f"{name}={value!r} is not one of {', '.join(allowed)}")
+    return value
+
+
 def _otel_enabled() -> bool:
     """Telemetry is on when — and only when — an OTLP endpoint is configured.
 
@@ -65,6 +77,13 @@ class Config:
     # --- Snapshot-expiry knobs (the customer-visible time-travel window) ---
     max_snapshot_age_ms: int
     min_snapshots_to_keep: int
+
+    # --- Orphan-file sweep (see orphans.py) ---
+    # The one part of this job that DELETES files, so it is off-by-default in
+    # spirit: "dry-run" measures and reports, only "delete" acts.
+    orphan_sweep_mode: str
+    orphan_min_age_seconds: int
+    orphan_max_deletes: int
 
     # --- Observability (see telemetry.py) ---
     # Everything else OpenTelemetry needs (endpoint, headers, service name,
@@ -133,6 +152,29 @@ def load_config() -> Config:
             os.environ.get("MAX_SNAPSHOT_AGE_MS", str(7 * 24 * 3600 * 1000))
         ),
         min_snapshots_to_keep=int(os.environ.get("MIN_SNAPSHOTS_TO_KEEP", "5")),
+        # Ships as "dry-run", not "delete": this is the only code here that
+        # removes customer data, and the number it reports is worth having on
+        # its own (until it existed, nothing anywhere said how much orphaned
+        # parquet a warehouse was paying for). Arm it per box once a run's
+        # report has been read — see docs/plans/iceberg-maintenance.md.
+        orphan_sweep_mode=_one_of(
+            "ORPHAN_SWEEP_MODE", "dry-run", ("off", "dry-run", "delete")
+        ),
+        # A file younger than this is never deleted, however unreachable it
+        # looks. Two reasons, and both are load-bearing: a concurrent writer's
+        # in-flight upload is not referenced yet by construction, and the
+        # reference set is read before the listing, so anything written between
+        # the two would otherwise look like garbage. 7 days also matches the
+        # time-travel window, which makes "how far back can a mistake reach"
+        # one number instead of two.
+        orphan_min_age_seconds=int(
+            os.environ.get("ORPHAN_MIN_AGE_SECONDS", str(7 * 24 * 3600))
+        ),
+        # Blast radius, per table per run. A bug that mistook the live file set
+        # for orphans costs at most this many files and gets a night to be
+        # noticed in; the cap truncates (loudly) rather than aborting, so a
+        # genuinely large backlog still drains over successive runs.
+        orphan_max_deletes=int(os.environ.get("ORPHAN_MAX_DELETES", "1000")),
         otel_enabled=_otel_enabled(),
         textfile_path=os.environ.get("TEXTFILE_PATH", ""),
     )

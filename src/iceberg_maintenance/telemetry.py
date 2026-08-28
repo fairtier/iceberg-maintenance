@@ -94,6 +94,30 @@ bytes_rewritten = _meter.create_counter(
         "write amplification."
     ),
 )
+orphan_files_found = _meter.create_counter(
+    "iceberg.maintenance.orphans.files.found",
+    unit="{file}",
+    description=(
+        "Files under a table's location that no retained snapshot can reach — "
+        "counted whether or not the sweep is armed to delete them."
+    ),
+)
+orphan_bytes_found = _meter.create_counter(
+    "iceberg.maintenance.orphans.bytes.found",
+    unit="By",
+    description=(
+        "Object storage held by unreachable files — what the warehouse is "
+        "paying for and nothing is reading."
+    ),
+)
+orphan_files_deleted = _meter.create_counter(
+    "iceberg.maintenance.orphans.files.deleted",
+    unit="{file}",
+    description=(
+        "Unreachable files the sweep actually removed. Zero in dry-run mode, "
+        "which is the point of having both numbers."
+    ),
+)
 snapshots_expired = _meter.create_counter(
     "iceberg.maintenance.snapshots.expired",
     unit="{snapshot}",

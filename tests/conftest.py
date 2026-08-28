@@ -42,6 +42,12 @@ _BASE = Config(
     commit_retry_backoff_seconds=0.0,
     max_snapshot_age_ms=7 * 24 * 3600 * 1000,
     min_snapshots_to_keep=5,
+    # The sweep is the one operation that deletes, so the shared base has it
+    # OFF: a test that wants it says so (`cfg(orphan_sweep_mode="delete")`),
+    # and no test acquires the power to delete by accident.
+    orphan_sweep_mode="off",
+    orphan_min_age_seconds=7 * 24 * 3600,
+    orphan_max_deletes=1000,
 )
 
 

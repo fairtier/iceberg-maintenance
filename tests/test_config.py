@@ -36,6 +36,12 @@ def test_defaults_match_chart(monkeypatch):
     assert cfg.commit_retry_backoff_seconds == 15
     assert cfg.max_snapshot_age_ms == 7 * 24 * 3600 * 1000
     assert cfg.min_snapshots_to_keep == 5
+    # The sweep ships measuring, not deleting — arming it is a per-box decision
+    # taken after a run's report has been read, never a default a self-hoster
+    # inherits by pulling the image.
+    assert cfg.orphan_sweep_mode == "dry-run"
+    assert cfg.orphan_min_age_seconds == 7 * 24 * 3600
+    assert cfg.orphan_max_deletes == 1000
     # AWS_REGION is the one optional connection var, defaulting to "auto".
     assert cfg.aws_region == "auto"
 
@@ -63,3 +69,21 @@ def test_missing_required_exits(monkeypatch):
     monkeypatch.setenv("CATALOG_URI", "http://lakekeeper:8181/catalog")
     with pytest.raises(SystemExit, match="WAREHOUSE"):
         load_config()
+
+
+def test_orphan_sweep_mode_rejects_a_typo(monkeypatch):
+    """A misspelled mode must not silently mean "the default".
+
+    For this variable specifically that is the difference between deleting and
+    not deleting, so it fails the run instead of guessing.
+    """
+    _set(monkeypatch, ORPHAN_SWEEP_MODE="delete-all")
+    with pytest.raises(SystemExit, match="ORPHAN_SWEEP_MODE"):
+        load_config()
+
+
+def test_orphan_sweep_mode_is_read(monkeypatch):
+    _set(monkeypatch, ORPHAN_SWEEP_MODE="delete", ORPHAN_MAX_DELETES="25")
+    cfg = load_config()
+    assert cfg.orphan_sweep_mode == "delete"
+    assert cfg.orphan_max_deletes == 25

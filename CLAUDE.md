@@ -1,7 +1,8 @@
 # iceberg-maintenance
 
-Nightly Iceberg table maintenance (small-file compaction + snapshot expiry) for
-a FairTier box warehouse, run as a Kubernetes CronJob.
+Nightly Iceberg table maintenance (small-file compaction, snapshot expiry and
+an orphan-file sweep) for a FairTier box warehouse, run as a Kubernetes
+CronJob.
 
 Published as `github.com/fairtier/iceberg-maintenance`. Docker images at
 `ghcr.io/fairtier/iceberg-maintenance`.
@@ -45,6 +46,7 @@ src/iceberg_maintenance/
   __main__.py       # entry point (python -m iceberg_maintenance)
   config.py         # environment-variable configuration (Config dataclass)
   maintenance.py    # compaction + snapshot expiry logic and the main loop
+  orphans.py        # orphan-file sweep — the only code here that DELETES
   telemetry.py      # OpenTelemetry setup + the instruments maintenance.py uses
 tests/              # pytest suite (conftest.py holds the local-warehouse fixture)
 ```
@@ -90,7 +92,19 @@ Rules that keep it honest:
   exist to keep it out. "OOM is a bug, not a small box."
 - **Atomic swap.** The old-files delete and new-files append commit in a single
   transaction; a crash before commit leaves the table completely untouched
-  (only orphan parquet in storage, which the orphan-sweep follow-up handles).
+  (only orphan parquet in storage, which the sweep below reclaims).
+- **The sweep refuses before it deletes.** `orphans.py` is the only code here
+  that removes files, so every ambiguity resolves to *keep*: it subtracts a
+  superset (every retained snapshot, every manifest, every entry including
+  `DELETED` ones, every metadata JSON, every statistics file), it aborts the
+  whole table on any read error or an empty reference set, it never touches a
+  file younger than `ORPHAN_MIN_AGE_SECONDS` (a concurrent writer's in-flight
+  upload is unreferenced by construction), it caps deletions per table, and it
+  ships in `dry-run`. Never make `delete` the default, never narrow the
+  reference set to the *current* snapshot (that is the time-travel window —
+  `test_a_retained_snapshots_files_survive_a_compaction`), and never let a
+  partially-read manifest reach the delete list
+  (`test_an_unreadable_manifest_deletes_nothing`).
 - **An unavailable catalog is retried; a lost race is not.** `commit_swap`
   re-offers the finished rewrite to a catalog that did not answer (connection
   error, 5xx) because the rewrite is the expensive half and the commit is one

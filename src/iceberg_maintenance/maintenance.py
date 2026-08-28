@@ -8,7 +8,10 @@ Walks every table in the warehouse and
      scan().to_arrow_batch_reader() is NOT lazy — see stream_batches);
   2. expires snapshots past the time-travel window (metadata-only: branch
      heads and tags are never expired, and a retention floor of the newest
-     snapshots is kept).
+     snapshots is kept);
+  3. sweeps the object storage those two leave behind — files under the
+     table's location that no retained snapshot can reach any more (see
+     orphans.py; reports by default, deletes only when armed).
 
 Safe against concurrent dlt loads: Iceberg's optimistic concurrency turns a
 clash into a failed commit here (logged, retried next night), never corrupted
@@ -21,11 +24,6 @@ plus the sentence a human reads — and the whole run is one trace when a
 collector is configured (see telemetry.py).
 
 Deliberately NOT handled here:
-  - orphan-file removal — no OSS option exists. Lakekeeper's
-    remove_orphan_files task queue is Enterprise-only, and PyIceberg's
-    implementation (PR #1958) died unmerged. Until an orphan sweep exists,
-    files unreferenced by expired snapshots stay in object storage (expiry
-    above only trims metadata);
   - tables with delete files (DuckFlight/DuckDB writes are merge-on-read) —
     a COW rewrite through PyIceberg's scan would need delete-file semantics
     PyIceberg only partially applies, so those tables are skipped loudly
@@ -77,7 +75,7 @@ from pyiceberg.io.pyarrow import (
 )
 from pyiceberg.manifest import ManifestContent, ManifestEntryStatus
 
-from . import telemetry
+from . import orphans, telemetry
 from .config import MIB, Config, load_config
 from .telemetry import tracer
 
@@ -105,6 +103,10 @@ class Outcome:
       empty        no snapshot at all
       expired      snapshots were expired
       nothing      expiry had nothing outside the window and floor
+      clean        the orphan sweep found nothing unreachable
+      orphans      the orphan sweep found files but is not armed to delete
+      swept        the orphan sweep deleted unreachable files
+      disabled     the orphan sweep is switched off
       conflict     lost the commit race to a concurrent write; retried next run
       failed       raised
     """
@@ -643,9 +645,12 @@ def expire_snapshots(table, cfg: Config) -> Outcome:
 
     Never expires branch heads or tags (PyIceberg protects those too), and
     always keeps the min_snapshots_to_keep newest snapshots regardless of
-    age, so a rarely-written table retains some history. Data/manifest files
-    of expired snapshots are NOT deleted — see the module docstring on the
-    missing orphan sweep.
+    age, so a rarely-written table retains some history.
+
+    Data/manifest files of expired snapshots are NOT deleted here — expiry is
+    metadata-only, and freeing the storage is the orphan sweep's job (see
+    orphans.py), which runs after this so that it sees the snapshots this pass
+    just dropped.
     """
     with tracer.start_as_current_span(
         "iceberg.expire_snapshots", attributes={"iceberg.table": ".".join(table.name())}
@@ -713,6 +718,36 @@ def run_operation(
     return outcome
 
 
+def run_sweep(name, table, s3_io, cfg: Config, summary: "RunSummary") -> Outcome:
+    """Sweep one table's orphans and fold its numbers into the run summary.
+
+    A function rather than three lines in the loop for two reasons. `sweep_table`
+    returns more than an `Outcome` (the found/deleted counts are the whole
+    output in dry-run mode) while `run_operation` — which owns the logging, the
+    timing, the metric and the never-raise contract — takes something that
+    returns exactly one; the closure that bridges the two belongs somewhere it
+    cannot outlive the call, because `maintain_warehouse` deletes `table` at the
+    end of every iteration to keep the run's RSS high-water at one table.
+
+    The sweep runs on **every** table, including the ones compaction refuses:
+    whether PyIceberg can *rewrite* a table's manifests and whether it can *read
+    the file paths out of them* are different questions, and only the second one
+    matters here — it is the same read the scan does on those tables every day.
+    """
+    result = orphans.SweepResult(Outcome("disabled", ""))
+
+    def work() -> Outcome:
+        nonlocal result
+        result = orphans.sweep_table(table, s3_io, cfg)
+        return result.outcome
+
+    outcome = run_operation(name, "sweep_orphans", "orphan sweep", work)
+    summary.orphan_files += result.files
+    summary.orphan_bytes += result.bytes
+    summary.orphan_deleted += result.deleted
+    return outcome
+
+
 @dataclass
 class RunSummary:
     """What the whole run did, in the three numbers an operator needs.
@@ -740,6 +775,13 @@ class RunSummary:
     tables: int = 0
     errors: int = 0
     unsupported_tables: list[str] = field(default_factory=list)
+    # What the orphan sweep FOUND, across every table — reported whether or not
+    # it was armed to delete any of it. That is the point: a box running in
+    # dry-run publishes the storage it is paying for and nobody is using, which
+    # is a number that did not exist anywhere before.
+    orphan_files: int = 0
+    orphan_bytes: int = 0
+    orphan_deleted: int = 0
 
     @property
     def unsupported(self) -> int:
@@ -794,9 +836,13 @@ def maintain_warehouse(catalog, s3_io, cfg: Config) -> RunSummary:
                     "snapshot expiry",
                     partial(expire_snapshots, table, cfg),
                 )
+                # And the sweep runs last, so it sees the snapshots expiry
+                # just dropped.
+                sweep = run_sweep(name, table, s3_io, cfg, summary)
+
                 # A conflict is not an error: the next run retries it. Anything
                 # that raised is, and it fails the whole job's exit code.
-                failed = [o for o in (compaction, expiry) if o.kind == "failed"]
+                failed = [o for o in (compaction, expiry, sweep) if o.kind == "failed"]
                 summary.errors += len(failed)
                 if failed:
                     table_span.set_status(StatusCode.ERROR)
@@ -830,7 +876,9 @@ def write_textfile(path: str, summary: RunSummary) -> None:
     This used to live in a shell wrapper in the chart, to avoid rebuilding the
     image for a heartbeat. It moved here when the un-compactable count needed
     publishing too: the wrapper could only see the exit code, and the whole
-    point of that count is that it is invisible in the exit code.
+    point of that count is that it is invisible in the exit code. The orphan
+    figures are the same shape of fact — a warehouse can be maintained
+    perfectly and still be paying for gigabytes nothing references.
     """
     directory = os.path.dirname(path) or "."
     tmp = f"{path}.tmp"
@@ -848,6 +896,15 @@ def write_textfile(path: str, summary: RunSummary) -> None:
         "decode). Snapshot expiry still runs on them.\n"
         "# TYPE iceberg_maintenance_tables_unsupported gauge\n"
         f"iceberg_maintenance_tables_unsupported {summary.unsupported}\n"
+        "# HELP iceberg_maintenance_orphan_files Files under the warehouse's "
+        "table locations that no retained snapshot can reach. Reported whether "
+        "or not the sweep is armed to delete them.\n"
+        "# TYPE iceberg_maintenance_orphan_files gauge\n"
+        f"iceberg_maintenance_orphan_files {summary.orphan_files}\n"
+        "# HELP iceberg_maintenance_orphan_bytes Object storage held by those "
+        "unreachable files — what the warehouse pays for and nothing reads.\n"
+        "# TYPE iceberg_maintenance_orphan_bytes gauge\n"
+        f"iceberg_maintenance_orphan_bytes {summary.orphan_bytes}\n"
     )
     os.makedirs(directory, exist_ok=True)
     with open(tmp, "w") as fh:
@@ -886,17 +943,25 @@ def main() -> int:
                     "iceberg.tables.scanned": summary.tables,
                     "iceberg.tables.failed": summary.errors,
                     "iceberg.tables.unsupported": summary.unsupported,
+                    "iceberg.orphans.files": summary.orphan_files,
+                    "iceberg.orphans.bytes": summary.orphan_bytes,
+                    "iceberg.orphans.deleted": summary.orphan_deleted,
                     "iceberg.outcome": run_outcome,
                 }
             )
             log.info(
-                "done: %d tables scanned, %d errors, %d un-compactable%s",
+                "done: %d tables scanned, %d errors, %d un-compactable%s, "
+                "%d orphan file(s) / %.1f MiB unreachable (%d deleted, mode=%s)",
                 summary.tables,
                 summary.errors,
                 summary.unsupported,
                 f" ({', '.join(summary.unsupported_tables)})"
                 if summary.unsupported_tables
                 else "",
+                summary.orphan_files,
+                summary.orphan_bytes / MIB,
+                summary.orphan_deleted,
+                cfg.orphan_sweep_mode,
             )
             if summary.errors:
                 return 1

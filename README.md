@@ -4,8 +4,9 @@
 [![License](https://img.shields.io/github/license/fairtier/iceberg-maintenance)](LICENSE)
 
 Nightly [Apache Iceberg](https://iceberg.apache.org/) table maintenance for a
-[FairTier](https://fairtier.com) box warehouse: **small-file compaction** plus
-**snapshot expiry**, run as a Kubernetes CronJob against the on-box
+[FairTier](https://fairtier.com) box warehouse: **small-file compaction**,
+**snapshot expiry** and an **orphan-file sweep**, run as a Kubernetes CronJob
+against the on-box
 [Lakekeeper](https://lakekeeper.io/) catalog.
 
 This is the baked-image form of what used to be a `pip install pyiceberg` at
@@ -39,8 +40,15 @@ For every table in the warehouse:
    customer-visible time-travel window) are expired, keeping the newest
    `MIN_SNAPSHOTS_TO_KEEP` regardless of age and never touching branch heads or
    tags. This is metadata-only.
+3. **Orphan-file sweep** — the storage half expiry cannot do. Everything under
+   the table's location is listed, every file any *retained* snapshot can still
+   reach is subtracted, and what is left — if it is older than
+   `ORPHAN_MIN_AGE_SECONDS` — is reported, and deleted only when
+   `ORPHAN_SWEEP_MODE=delete`. It runs **after** expiry, so it sees the
+   snapshots that pass just let go of. See [Orphan-file sweep](#orphan-file-sweep)
+   below, because this is the one thing here that deletes.
 
-Compaction and expiry are each per-table and independent; a failure or skip on
+The three are per-table and independent; a failure or skip on
 one table never blocks the others, and a commit lost to a concurrent dlt load
 is logged and retried next run (Iceberg optimistic concurrency — never
 corrupted data).
@@ -58,12 +66,44 @@ corrupted data).
 > the retry re-reads the table first: if the swap landed and only the response
 > was lost, it stops there rather than minting a second identical snapshot.
 
+### Orphan-file sweep
+
+Snapshot expiry is metadata-only, so on its own it frees **nothing**.
+Compaction is worse than nothing for storage: every rewrite replaces a
+generation of data files, and the generation it replaced is unreferenced the
+moment the swap commits — but still paid for, forever. A rewrite whose commit
+is *lost* orphans its output without even buying a compaction: one box streamed
+107 fresh parquet files (~1.4 GiB) and then lost the commit to a crashlooping
+catalog.
+
+No OSS tool does this — Lakekeeper's `remove_orphan_files` queue is
+Enterprise-only, PyIceberg's implementation (PR #1958) never merged, everything
+else is JVM — so `orphans.py` does it, written as a set of refusals:
+
+- **A superset is subtracted.** Every snapshot in the metadata (not just the
+  current one — time travel is a product promise), every manifest of every
+  snapshot, every manifest entry including `DELETED` ones, every metadata JSON
+  in `metadata_log`, every statistics file. When in doubt a file is kept.
+- **Any surprise aborts that table.** An unreadable manifest, a listing that
+  errors, an empty reference set, or a location shallow enough to be a bucket
+  root ends the sweep for that table having deleted nothing. There is no
+  partial-knowledge path that deletes.
+- **Age, not just reachability.** Nothing younger than `ORPHAN_MIN_AGE_SECONDS`
+  is ever removed: a concurrent writer's in-flight upload is unreferenced by
+  construction, and the reference set is read *before* the listing.
+- **A blast-radius cap.** `ORPHAN_MAX_DELETES` files per table per run. It
+  truncates rather than aborts (the next run takes the rest) and logs when it
+  bites — a silent cap reads as "swept clean" when it is not.
+- **Off unless armed.** The default is `dry-run`: it measures and reports.
+  `ORPHAN_SWEEP_MODE=delete` is a deliberate, per-deployment decision taken
+  after a run's report has been read.
+
+Even in `dry-run` the numbers are worth having on their own — until this
+existed, nothing anywhere said how much orphaned parquet a warehouse was
+paying for.
+
 ### Deliberately not handled
 
-- **Orphan-file removal** — no OSS option exists (Lakekeeper's queue is
-  Enterprise-only; PyIceberg's implementation never merged). Snapshot expiry
-  above trims *metadata* only; the unreferenced data files stay in object
-  storage until an orphan sweep exists. This is a tracked open gap.
 - **Tables with delete files** (DuckFlight/DuckDB merge-on-read writes) — a
   copy-on-write rewrite isn't safe for them, so compaction skips them loudly.
   Snapshot expiry still runs (it never touches data files).
@@ -145,19 +185,24 @@ chart). Defaults mirror that chart's `values.yaml`.
 | `REWRITE_CHUNK_BYTES`        | `134217728`    | Streaming chunk size — the **only** thing that sets peak rewrite memory (constant in table size), and the approximate output data-file size |
 | `MAX_SNAPSHOT_AGE_MS`        | `604800000`    | Time-travel window; snapshots older than this are expired (7 days)         |
 | `MIN_SNAPSHOTS_TO_KEEP`      | `5`            | Retention floor: always keep the newest N snapshots regardless of age      |
+| `ORPHAN_SWEEP_MODE`          | `dry-run`      | `off`, `dry-run` (find and report) or `delete` (actually remove). A value that is none of the three fails the run rather than defaulting |
+| `ORPHAN_MIN_AGE_SECONDS`     | `604800`       | Never delete a file younger than this, however unreachable it looks (7 days) |
+| `ORPHAN_MAX_DELETES`         | `1000`         | Blast-radius cap, per table per run. Truncates loudly; the next run takes the rest |
 | `TEXTFILE_PATH`              | *(unset)*      | Write the run's numbers here as a node_exporter textfile — see below. Unset writes nothing |
 
 ### Observability without a collector (node_exporter textfile)
 
 OTLP below is the richer signal, but it needs a collector on the far end. Set
 `TEXTFILE_PATH=/textfile/iceberg_maintenance.prom` and a **clean** run also
-writes three gauges to a file the box's existing node exporter already scrapes:
+writes five gauges to a file the box's existing node exporter already scrapes:
 
 | Metric | Meaning |
 |---|---|
 | `iceberg_maintenance_last_success_timestamp_seconds` | When the last error-free run finished |
 | `iceberg_maintenance_tables_scanned` | Tables it visited |
 | `iceberg_maintenance_tables_unsupported` | Tables it **could not compact at all** |
+| `iceberg_maintenance_orphan_files` | Files no retained snapshot can reach |
+| `iceberg_maintenance_orphan_bytes` | Object storage those files hold — reported whether or not the sweep is armed to delete them |
 
 Three things about it are deliberate:
 
@@ -205,7 +250,9 @@ iceberg.maintenance.run
     │   ├── iceberg.compact.check_manifests
     │   ├── iceberg.compact.rewrite            one "chunk written" event per flush
     │   └── iceberg.compact.commit               (rows, bytes, files so far)
-    └── iceberg.expire_snapshots               iceberg.outcome, snapshot counts
+    ├── iceberg.expire_snapshots               iceberg.outcome, snapshot counts
+    └── iceberg.sweep_orphans                  iceberg.orphans.mode/listed/
+                                                 files/bytes/deleted
 ```
 
 Catalog HTTP calls (Lakekeeper, the OAuth token endpoint) are traced too, via
@@ -223,9 +270,13 @@ client and stays invisible.
 | `iceberg.maintenance.compaction.files.written`  | counter   | —                               |
 | `iceberg.maintenance.compaction.bytes.rewritten`| counter   | —                               |
 | `iceberg.maintenance.snapshots.expired`         | counter   | —                               |
+| `iceberg.maintenance.orphans.files.found`       | counter   | —                               |
+| `iceberg.maintenance.orphans.bytes.found`       | counter   | —                               |
+| `iceberg.maintenance.orphans.files.deleted`     | counter   | — (zero in `dry-run`, which is the point of having both) |
 
 `iceberg.outcome` is the headline label — `compacted`, `healthy`, `skipped`,
-`unsupported`, `empty`, `expired`, `nothing`, `conflict`, `failed` (see
+`unsupported`, `empty`, `expired`, `nothing`, `clean`, `orphans`, `swept`,
+`disabled`, `conflict`, `failed` (see
 `Outcome` in `maintenance.py`). Alert on `failed`, and on a standing
 `unsupported`; a rising `conflict` means compaction keeps losing the commit
 race to concurrent dlt loads. Table names are deliberately **spans-only**,
