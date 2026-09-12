@@ -11,7 +11,7 @@ dependencies = [
     # chunks — safe ONLY because the version is frozen, so internals can't
     # shift under it. Bump deliberately (and revisit the internal import) — see
     # the AWAITING-UPSTREAM note in maintenance.py.
-    "pyiceberg[pyarrow]==0.11.1",
+    "pyiceberg[pyarrow]==0.12.0",
     # Imported directly (maintenance.py builds the streamed chunks and releases
     # the arena between tables). Provided transitively by pyiceberg[pyarrow]
     # above; declared here because we import it by name. Left unpinned so uv
