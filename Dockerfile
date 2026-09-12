@@ -1,7 +1,7 @@
 ############################
 # STEP 1: Build with uv
 ############################
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 COPY --from=ghcr.io/astral-sh/uv:0.12.0 /uv /usr/local/bin/uv
 
@@ -25,7 +25,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ############################
 # STEP 2: Runtime image
 ############################
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # Copy the virtual environment from builder
 COPY --from=builder /app/.venv /app/.venv
