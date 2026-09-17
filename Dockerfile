@@ -1,7 +1,13 @@
 ############################
 # STEP 1: Build with uv
 ############################
-FROM python:3.12-slim AS builder
+# 3.13 is the ceiling, and it is pyiceberg's, not ours: 0.11.1 publishes
+# wheels for cp310-cp313 only, so on 3.14 the resolver falls back to the sdist
+# and compiles the Cython avro decoder — which a -slim image has no compiler
+# for. CI runs lint + pytest and never builds this image, so that failure would
+# first appear on a `v*` release tag. The pin is deliberate (see pyproject.toml),
+# so this moves when pyiceberg does.
+FROM python:3.13-slim AS builder
 
 COPY --from=ghcr.io/astral-sh/uv:0.12.0 /uv /usr/local/bin/uv
 
@@ -25,7 +31,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ############################
 # STEP 2: Runtime image
 ############################
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 # Copy the virtual environment from builder
 COPY --from=builder /app/.venv /app/.venv
