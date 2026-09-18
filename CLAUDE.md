@@ -32,11 +32,13 @@ zero errors before committing.
 ## Package management
 
 [uv](https://github.com/astral-sh/uv); the lockfile (`uv.lock`) is committed.
-`pyiceberg` is pinned **exactly** to `0.11.1` — do not loosen it. The
+`pyiceberg` is pinned **exactly** to `0.12.0` — do not loosen it. The
 compaction rewrite depends on a PyIceberg-internal helper
 (`_dataframe_to_data_files`), which is only safe because the version is frozen.
-See the `AWAITING-UPSTREAM` note in `maintenance.py` for the release that lets
-the hand-rolled streaming block collapse to a one-liner.
+0.12.0 added a public streaming `Transaction.overwrite`, and it is **not** a
+replacement: it writes the parquet inside the transaction, which would fuse the
+rewrite to the commit and undo `commit_swap`'s retry. The long note in
+`compact_table` spells this out — read it before touching the two-phase block.
 
 ## Project structure
 
@@ -119,11 +121,16 @@ Rules that keep it honest:
 - **An unavailable catalog is retried; a lost race is not.** `commit_swap`
   re-offers the finished rewrite to a catalog that did not answer (connection
   error, 5xx) because the rewrite is the expensive half and the commit is one
-  HTTP call. It must never retry a `CommitFailedException`, and must never
-  rebase the swap onto a snapshot a concurrent writer produced — the swap is
+  HTTP call. It must never retry a lost race (`_LOST_RACE` — since pyiceberg
+  0.12.0 that is `CommitFailedException` *or* the `ValidationException` raised
+  by pyiceberg's own inner retry), and must never rebase the swap onto a
+  snapshot a concurrent writer produced — the swap is
   `delete(ALWAYS_TRUE) + append`, so that would drop their rows
-  (`test_a_concurrent_write_during_the_retry_is_not_clobbered`). On a
-  state-unknown 5xx it re-reads the table before believing the commit failed.
+  (`test_a_concurrent_write_during_the_retry_is_not_clobbered` for our retry,
+  `test_the_inner_retry_does_not_clobber_a_concurrent_writer` for pyiceberg's).
+  Both types must stay classified as `conflict`, never `failed`: contention is
+  normal and must not page. On a state-unknown 5xx it re-reads the table
+  before believing the commit failed.
 - **Safe skips, checked before any write.** Tables with delete files
   (merge-on-read) and tables whose manifest entries PyIceberg mis-decodes
   (DuckDB's Iceberg writer — `status` holds the snapshot id, `sequence_number`

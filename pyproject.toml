@@ -10,7 +10,8 @@ dependencies = [
     # (underscore) helper, `_dataframe_to_data_files`, to stream a rewrite in
     # chunks — safe ONLY because the version is frozen, so internals can't
     # shift under it. Bump deliberately (and revisit the internal import) — see
-    # the AWAITING-UPSTREAM note in maintenance.py.
+    # the long note in compact_table for why the public streaming `overwrite`
+    # that 0.12.0 added is NOT a replacement for it.
     "pyiceberg[pyarrow]==0.12.0",
     # Imported directly (maintenance.py builds the streamed chunks and releases
     # the arena between tables). Provided transitively by pyiceberg[pyarrow]

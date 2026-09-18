@@ -55,6 +55,7 @@ from pyiceberg.exceptions import (
     CommitStateUnknownException,
     ServerError,
     ServiceUnavailableError,
+    ValidationException,
 )
 from pyiceberg.expressions import AlwaysTrue
 
@@ -63,9 +64,9 @@ from pyiceberg.expressions import AlwaysTrue
 # helpers. Depending on them is deliberate and safe *because the version is
 # pinned* (pyproject.toml pins pyiceberg==0.11.1) — internals can't shift under
 # a frozen pin. `_dataframe_to_data_files` is the same function
-# `Table.overwrite` calls; we drive it directly only to feed it a streamed
-# reader in chunks instead of one materialized table, which the released 0.11.1
-# public API refuses (see AWAITING-UPSTREAM in compact_table). Revisit on every
+# `Table.overwrite` calls; we drive it directly to keep the parquet writing
+# OUTSIDE the transaction, which the public API does not allow and which the
+# commit retry requires (see the long note in compact_table). Revisit on every
 # pyiceberg bump.
 from pyiceberg.io.pyarrow import (
     ArrowScan,
@@ -262,8 +263,22 @@ def unrewritable_manifest_reason(table, snapshot) -> str | None:
     return None
 
 
+# A lost commit race arrives as one of two types since pyiceberg 0.12.0, and
+# they mean the same thing to us. `CommitFailedException` is the catalog
+# refusing our requirements. `ValidationException` is 0.12.0's own retry
+# (Transaction.commit_transaction re-offers a failed commit up to
+# `commit.retry.num-retries` times) refusing to rebase the swap: before each
+# re-offer it refreshes and runs `_validate_concurrency`, and because our
+# delete predicate is ALWAYS_TRUE at serializable isolation, *any* data file a
+# concurrent writer added is a conflict. That is the same verdict
+# `commit_swap` reaches on its own — see its docstring — so the race is still
+# never retried and a concurrent writer's rows are never dropped; only the
+# exception type differs.
+_LOST_RACE = (CommitFailedException, ValidationException)
+
+
 # Commit failures that mean "the catalog was not there", as opposed to "someone
-# else got there first" (CommitFailedException — yield, retry tomorrow) or "this
+# else got there first" (_LOST_RACE — yield, retry tomorrow) or "this
 # request is wrong" (4xx — retrying changes nothing).
 _UNAVAILABLE_CATALOG = (
     # Nothing answered. Lakekeeper crashlooping, CoreDNS restarted, the box
@@ -315,10 +330,11 @@ def commit_swap(table, data_files, base_snapshot_id: int, cfg: Config) -> int:
     Two things it refuses to do, both of which would be worse than the loss it
     prevents:
 
-    - **It does not retry a lost race.** `CommitFailedException` means a
-      concurrent dlt load advanced the branch; the rewrite is stale by
-      definition and yielding is correct (the caller reports `conflict` and
-      the next night retries).
+    - **It does not retry a lost race.** `_LOST_RACE` means a concurrent dlt
+      load advanced the branch; the rewrite is stale by definition and
+      yielding is correct (the caller reports `conflict` and the next night
+      retries). Since pyiceberg 0.12.0 the same verdict can be reached one
+      layer down, as a `ValidationException` — see the `_LOST_RACE` note.
     - **It does not re-aim the swap at a table that moved.** The swap is
       `delete(ALWAYS_TRUE) + append(our files)`, which is only safe against the
       snapshot it was planned on. Refreshing onto a snapshot a *concurrent*
@@ -339,7 +355,7 @@ def commit_swap(table, data_files, base_snapshot_id: int, cfg: Config) -> int:
                     for data_file in data_files:
                         append_files.append_data_file(data_file)
             return attempt
-        except CommitFailedException:
+        except _LOST_RACE:
             raise
         except _UNAVAILABLE_CATALOG as exc:
             last = exc
@@ -505,21 +521,31 @@ def _compact_table(span: Span, table, s3_io, cfg: Config) -> Outcome:
     # Streamed, atomic rewrite — peak memory is O(1) in table size (bounded by
     # cfg.rewrite_chunk_bytes, constant), no whole-table buffer, no size cap.
     #
-    # AWAITING-UPSTREAM: the one-liner this *wants* to be is
-    # `table.overwrite(table.scan().to_arrow_batch_reader())` — PyIceberg
-    # consuming a RecordBatchReader lazily in a single atomic overwrite. That
-    # landed on pyiceberg `main` (Table/Transaction.overwrite/append widened to
-    # `pa.Table | pa.RecordBatchReader`, streamed via _dataframe_to_data_files)
-    # but is UNRELEASED: the latest release, 0.11.1 (our pin), still raises
-    # `ValueError("Expected PyArrow table")` on a reader. When a release ships
-    # with it, delete this whole block and use that one call, dropping the
-    # `_dataframe_to_data_files` import — but keep feeding it `stream_batches`,
-    # NOT `scan.to_arrow_batch_reader()`: the reader that method hands back
-    # buffers whole files behind an executor (see stream_batches), so the
-    # tidy-looking one-liner would quietly restore the OOM. Until then we
-    # reproduce exactly what 0.11.1's own Transaction.overwrite does
-    # internally, but feed the reader in chunks instead of one materialized
-    # table.
+    # NOT-AWAITING-UPSTREAM ANY MORE — and the answer turned out to be no.
+    # This block used to carry an AWAITING-UPSTREAM note saying that when a
+    # release shipped a streaming `Transaction.overwrite`, the whole thing
+    # should collapse to `table.overwrite(stream_batches(...))`. 0.12.0 is
+    # that release (`df: pa.Table | pa.RecordBatchReader`). Do not take it.
+    #
+    # The reason is the retry, which was written *after* that note. 0.12.0's
+    # `overwrite` calls `_dataframe_to_data_files` INSIDE
+    # `with self._append_snapshot_producer(...)` — the parquet writing happens
+    # within the transaction, so rewrite and commit become one unit. That is
+    # exactly the split `commit_swap` depends on: the rewrite is minutes and
+    # gigabytes, the commit is one HTTP call, and re-offering the second
+    # without redoing the first is the whole point (see commit_swap's
+    # docstring and the 2026-08-27 loss it cites). Collapsing to the one-liner
+    # would mean a `Connection refused` on the commit throws away the entire
+    # rewrite again — a tidier-looking body that reinstates a known incident.
+    #
+    # So we keep doing by hand what `overwrite` does internally, in two
+    # phases, because we need to be able to retry the cheap half alone. If a
+    # future release separates writing from committing (a public way to get
+    # DataFiles without an open transaction), revisit — and even then keep
+    # feeding it `stream_batches`, NOT `scan.to_arrow_batch_reader()`: the
+    # reader that method hands back buffers whole files behind an executor
+    # (see stream_batches), so the tidy-looking version would quietly restore
+    # the OOM.
     #
     # Phase 1 (heavy; NO transaction open): stream the scan, accumulate batches
     # to ~cfg.rewrite_chunk_bytes, write each chunk to fresh parquet data files
@@ -615,8 +641,8 @@ def _compact_table(span: Span, table, s3_io, cfg: Config) -> Outcome:
     # transaction commits BOTH the delete and the append together, and — since
     # Transaction.__exit__ commits only when no exception propagates — a crash
     # here also leaves the table untouched. A concurrent dlt load that advanced
-    # the branch loses the commit race (CommitFailedException, caught by the
-    # caller and retried next night), exactly as the stock overwrite would.
+    # the branch loses the commit race (_LOST_RACE, caught by the caller and
+    # retried next night), exactly as the stock overwrite would.
     #
     # An *unavailable* catalog is not that, and is retried rather than thrown
     # away with the whole rewrite behind it — see commit_swap.
@@ -702,7 +728,7 @@ def run_operation(
     try:
         outcome = work()
         log.info("%s: %s: %s", name, label, outcome)
-    except CommitFailedException as exc:
+    except _LOST_RACE as exc:
         # Concurrent write won the race — fine, next night retries.
         log.warning(
             "%s: %s commit conflict (concurrent write?), retrying next run: %s",

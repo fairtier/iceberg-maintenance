@@ -59,7 +59,9 @@ corrupted data).
 > A box lost a finished 1.4 GiB rewrite to a single `Connection refused` while
 > Lakekeeper was crashlooping, and it became 1.4 GiB of orphans no OSS tool can
 > sweep. Two things the retry will not do: retry a **lost race**
-> (`CommitFailedException` — the rewrite is stale, yield), or re-aim the swap
+> (`CommitFailedException`, or the `ValidationException` pyiceberg's own inner
+> retry raises when it refuses to rebase — the rewrite is stale, yield), or
+> re-aim the swap
 > at a snapshot a **concurrent writer** produced (the swap is
 > `delete(ALWAYS_TRUE) + append`, and rebasing it onto someone else's snapshot
 > would silently drop their rows). A `500`/`502`/`504` says *state unknown*, so
