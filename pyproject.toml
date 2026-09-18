@@ -1,6 +1,6 @@
 [project]
 name = "iceberg-maintenance"
-version = "0.9.0"
+version = "0.10.0"
 description = "Nightly Iceberg table maintenance (small-file compaction, snapshot expiry, orphan-file sweep) for a FairTier box warehouse"
 readme = "README.md"
 license = "Apache-2.0"
@@ -10,8 +10,9 @@ dependencies = [
     # (underscore) helper, `_dataframe_to_data_files`, to stream a rewrite in
     # chunks — safe ONLY because the version is frozen, so internals can't
     # shift under it. Bump deliberately (and revisit the internal import) — see
-    # the AWAITING-UPSTREAM note in maintenance.py.
-    "pyiceberg[pyarrow]==0.11.1",
+    # the long note in compact_table for why the public streaming `overwrite`
+    # that 0.12.0 added is NOT a replacement for it.
+    "pyiceberg[pyarrow]==0.12.0",
     # Imported directly (maintenance.py builds the streamed chunks and releases
     # the arena between tables). Provided transitively by pyiceberg[pyarrow]
     # above; declared here because we import it by name. Left unpinned so uv

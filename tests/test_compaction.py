@@ -12,7 +12,12 @@ The warehouse fixture and the config factory live in conftest.py.
 import pytest
 import requests
 from conftest import FILES, ROWS_PER_FILE
-from pyiceberg.exceptions import CommitFailedException, CommitStateUnknownException
+from pyiceberg.exceptions import (
+    CommitFailedException,
+    CommitStateUnknownException,
+    ValidationException,
+)
+from pyiceberg.table import TableProperties
 
 from iceberg_maintenance.maintenance import (
     compact_table,
@@ -243,7 +248,17 @@ def test_commit_gives_up_after_the_attempt_budget(table, cfg, monkeypatch):
 
 def test_a_lost_commit_race_is_not_retried(table, cfg, monkeypatch):
     """A concurrent writer advanced the branch: the rewrite is stale by
-    definition, so yield rather than insist."""
+    definition, so yield rather than insist.
+
+    Counted in *our* attempts, not in catalog calls. Since pyiceberg 0.12.0 a
+    failed commit is re-offered inside `Transaction.commit_transaction`
+    (`commit.retry.num-retries`, default 4) before it ever reaches us, so one
+    attempt of ours is `1 + num_retries` calls. What this pins is that
+    `commit_swap` adds no attempts of its own on top: were it retrying, five
+    attempts would be five times this number.
+    """
+    per_attempt = 1 + TableProperties.COMMIT_NUM_RETRIES_DEFAULT
+
     state = _flaky_commit(
         monkeypatch, fail_times=99, exc=CommitFailedException("someone else won")
     )
@@ -252,7 +267,54 @@ def test_a_lost_commit_race_is_not_retried(table, cfg, monkeypatch):
     with pytest.raises(CommitFailedException):
         compact_table(table, table.io, cfg(commit_max_attempts=5))
 
+    assert state["calls"] == per_attempt
+
+
+def test_the_inner_retry_does_not_clobber_a_concurrent_writer(
+    table, cfg, warehouse, monkeypatch
+):
+    """The same hazard as the test below, on pyiceberg's own retry path.
+
+    `test_a_concurrent_write_during_the_retry_is_not_clobbered` guards the
+    retry *we* wrote. Since 0.12.0 there is a second one underneath it: on
+    `CommitFailedException` the transaction refreshes and rebuilds the swap
+    against whatever the branch head is now — which is precisely the rebase
+    `commit_swap` refuses to do, and with `delete(ALWAYS_TRUE)` it would drop
+    the concurrent writer's rows.
+
+    It does not, because 0.12.0 validates before it rebuilds: our delete
+    predicate is ALWAYS_TRUE at serializable isolation, so any data file added
+    in the meantime is a conflict and the attempt ends as a
+    `ValidationException`. This test is what says so out loud — if a future
+    bump loosens that validation, the rows disappear here first.
+    """
+    import pyarrow
+
+    def concurrent_append():
+        other = warehouse.load_table("ns.small_files")
+        other.append(
+            pyarrow.table(
+                {"id": [999_999], "payload": ["written-by-someone-else"]},
+                schema=other.schema().as_arrow(),
+            )
+        )
+
+    state = _flaky_commit(
+        monkeypatch,
+        fail_times=1,
+        exc=CommitFailedException("someone else won"),
+        before=concurrent_append,
+    )
+    state["armed"] = True
+
+    with pytest.raises(ValidationException):
+        compact_table(table, table.io, cfg(commit_max_attempts=1))
+
+    # The rewrite yielded before the rebase: one call, and their row is live.
     assert state["calls"] == 1
+    table.refresh()
+    assert 999_999 in _rows(table)["id"]
+    assert len(_rows(table)["id"]) == FILES * ROWS_PER_FILE + 1
 
 
 def test_a_landed_commit_is_not_committed_twice(table, cfg, monkeypatch):
