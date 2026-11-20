@@ -7,7 +7,7 @@
 # for. CI runs lint + pytest and never builds this image, so that failure would
 # first appear on a `v*` release tag. The pin is deliberate (see pyproject.toml),
 # so this moves when pyiceberg does.
-FROM python:3.13-slim AS builder
+FROM python:3.15-slim AS builder
 
 COPY --from=ghcr.io/astral-sh/uv:0.13.5 /uv /usr/local/bin/uv
 
@@ -31,7 +31,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ############################
 # STEP 2: Runtime image
 ############################
-FROM python:3.13-slim
+FROM python:3.15-slim
 
 # Copy the virtual environment from builder
 COPY --from=builder /app/.venv /app/.venv
