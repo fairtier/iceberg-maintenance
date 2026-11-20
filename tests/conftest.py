@@ -4,6 +4,7 @@ in-memory OpenTelemetry SDK to assert against."""
 import dataclasses
 
 import pyarrow
+import pyarrow.parquet as pq
 import pytest
 from opentelemetry import metrics, trace
 from opentelemetry.sdk.metrics import MeterProvider
@@ -12,6 +13,20 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pyiceberg.catalog.memory import InMemoryCatalog
+from pyiceberg.expressions import AlwaysTrue
+from pyiceberg.manifest import (
+    DataFile,
+    DataFileContent,
+    FileFormat,
+    ManifestContent,
+    ManifestEntry,
+    ManifestEntryStatus,
+    ManifestWriterV2,
+    write_manifest_list,
+)
+from pyiceberg.table.snapshots import Operation, Snapshot, Summary
+from pyiceberg.table.update import AddSnapshotUpdate, SetSnapshotRefUpdate
+from pyiceberg.typedef import Record
 
 from iceberg_maintenance.config import MIB, Config
 
@@ -91,6 +106,173 @@ def table(warehouse):
             )
         )
     return tbl
+
+
+EVOLVED_ROWS_PER_FILE = 10
+
+
+@pytest.fixture
+def evolved(warehouse):
+    """A table repartitioned after its data was written (ALTER ... SET PARTITIONED BY)."""
+    schema = pyarrow.schema(
+        [
+            pyarrow.field("id", pyarrow.int64(), nullable=False),
+            pyarrow.field("g", pyarrow.int32(), nullable=False),
+            pyarrow.field("h", pyarrow.int32(), nullable=False),
+        ]
+    )
+    tbl = warehouse.create_table("ns.evolved", schema=schema)
+    with tbl.update_spec() as update:
+        update.add_identity("g")
+    for f in range(FILES):
+        ids = range(f * EVOLVED_ROWS_PER_FILE, (f + 1) * EVOLVED_ROWS_PER_FILE)
+        tbl.append(
+            pyarrow.table(
+                {
+                    "id": list(ids),
+                    "g": [0] * EVOLVED_ROWS_PER_FILE,
+                    "h": [0] * EVOLVED_ROWS_PER_FILE,
+                },
+                schema=schema,
+            )
+        )
+    with tbl.update_spec() as update:
+        update.remove_field("g")
+        update.add_identity("h")
+    return tbl
+
+
+def commit_delete_file(
+    tbl,
+    rows_per_data_file=1,
+    *,
+    partition=None,
+    content=DataFileContent.POSITION_DELETES,
+    file_format=FileFormat.PARQUET,
+    entry_content=None,
+    manifest_content=ManifestContent.DELETES,
+    removed=False,
+    summary=None,
+    spell=lambda path: path,
+):
+    """Commit a snapshot adding one real delete file, as DuckDB does.
+
+    PyIceberg cannot write delete files, so the parquet, manifest and manifest
+    list are written by hand. It deletes the first rows of every live data file.
+
+    `spell` rewrites how the delete file names each target, e.g. with a scheme
+    the manifests don't use: readers resolve both to the same object.
+
+    By default it has the shape DuckDB 1.5.4 gives a table repartitioned after
+    its data was written: filed under the current spec with the same partition
+    value as its data files (Record[0] under spec 2 beside Record[0] under spec
+    1), so PyIceberg's scan matches it to no data file, and with no
+    `total-delete-files` in the summary. (With data under the new spec as well,
+    DuckDB writes Record[0, None] instead; that matches nothing either.)
+    """
+
+    class _Writer(ManifestWriterV2):
+        def content(self):
+            return manifest_content
+
+    spec = tbl.spec()
+    snapshot_id = tbl.metadata.new_snapshot_id()
+    sequence_number = tbl.metadata.next_sequence_number()
+    parent = tbl.current_snapshot()
+    location = f"{tbl.metadata.location}/metadata/{snapshot_id}"
+
+    path = f"{tbl.metadata.location}/data/{snapshot_id}-deletes.parquet"
+    targets = [
+        (spell(task.file.file_path), position)
+        for task in tbl.scan().plan_files()
+        for position in range(rows_per_data_file)
+    ]
+    written = pyarrow.table(
+        {
+            "file_path": pyarrow.array([t[0] for t in targets], pyarrow.string()),
+            "pos": pyarrow.array([t[1] for t in targets], pyarrow.int64()),
+        }
+    )
+    with tbl.io.new_output(path).create() as stream:
+        pq.write_table(written, stream)
+
+    delete_file = DataFile.from_args(
+        content=content if entry_content is None else entry_content,
+        file_path=path,
+        file_format=file_format,
+        partition=Record(0) if partition is None else partition,
+        record_count=written.num_rows,
+        file_size_in_bytes=tbl.io.new_input(path).__len__(),
+    )
+    delete_file.spec_id = spec.spec_id
+    with _Writer(
+        spec,
+        tbl.schema(),
+        tbl.io.new_output(f"{location}-m0.avro"),
+        snapshot_id,
+        "null",
+    ) as writer:
+        writer.add_entry(
+            ManifestEntry.from_args(
+                status=ManifestEntryStatus.DELETED
+                if removed
+                else ManifestEntryStatus.ADDED,
+                snapshot_id=snapshot_id,
+                sequence_number=sequence_number,
+                file_sequence_number=sequence_number,
+                data_file=delete_file,
+            )
+        )
+    manifest = writer.to_manifest_file()
+    with write_manifest_list(
+        2,
+        tbl.io.new_output(f"{location}.avro"),
+        snapshot_id,
+        parent.snapshot_id,
+        sequence_number,
+        "null",
+    ) as manifest_list:
+        manifest_list.add_manifests([*parent.manifests(tbl.io), manifest])
+    tbl.catalog.commit_table(
+        tbl,
+        (),
+        (
+            AddSnapshotUpdate(
+                snapshot=Snapshot(
+                    snapshot_id=snapshot_id,
+                    parent_snapshot_id=parent.snapshot_id,
+                    sequence_number=sequence_number,
+                    timestamp_ms=parent.timestamp_ms + 1,
+                    manifest_list=f"{location}.avro",
+                    summary=Summary(Operation.DELETE, **(summary or {})),
+                    schema_id=tbl.schema().schema_id,
+                )
+            ),
+            SetSnapshotRefUpdate(
+                ref_name="main",
+                type="branch",
+                snapshot_id=snapshot_id,
+            ),
+        ),
+    )
+    tbl.refresh()
+
+
+def append_rows(tbl, ids):
+    tbl.append(
+        pyarrow.table(
+            {"id": ids, "g": [1] * len(ids), "h": [0] * len(ids)},
+            schema=tbl.schema().as_arrow(),
+        )
+    )
+    tbl.refresh()
+
+
+def replace_rows(tbl, ids):
+    """What dlt's `replace` does: a truncate, committed alone, then appends."""
+    tbl.delete(delete_filter=AlwaysTrue())
+    tbl.refresh()
+    append_rows(tbl, ids)
 
 
 @pytest.fixture(scope="session")

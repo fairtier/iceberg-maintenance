@@ -144,6 +144,30 @@ def test_a_failed_run_leaves_the_previous_heartbeat_standing(
     assert not (tmp_path / "m.prom").exists()
 
 
+def test_a_manifest_read_failure_exits_non_zero_with_no_heartbeat(
+    table, cfg, warehouse, monkeypatch, tmp_path
+):
+    """A storage fault must page, not read as "N tables un-compactable, 0 errors"."""
+    from pyiceberg.manifest import ManifestFile
+
+    def unreadable(self, io, discard_deleted=True):
+        raise OSError("connection reset")
+
+    head = table.current_snapshot().snapshot_id
+    monkeypatch.setattr(ManifestFile, "fetch_manifest_entry", unreadable)
+    monkeypatch.setattr(maintenance, "load_catalog", lambda *a, **k: warehouse)
+    monkeypatch.setattr(maintenance, "direct_s3_io", lambda c: table.io)
+    monkeypatch.setattr(
+        maintenance, "load_config", lambda: cfg(textfile_path=str(tmp_path / "m.prom"))
+    )
+
+    assert maintenance.main() == 1
+    assert not (tmp_path / "m.prom").exists()
+    monkeypatch.undo()
+    table.refresh()
+    assert table.current_snapshot().snapshot_id == head
+
+
 def test_the_textfile_says_whether_the_sweep_is_armed(tmp_path, cfg):
     """`armed` is what separates "not draining" from "not armed".
 

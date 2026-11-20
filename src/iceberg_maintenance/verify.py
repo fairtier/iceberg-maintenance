@@ -10,7 +10,7 @@ covered by another box's proof — DuckDB's Iceberg writer already decodes
 differently enough to make compaction unsafe on the tables it wrote.
 
 This module is that check as shipped, tested code rather than the throwaway
-script it was the first time (2026-08-28, fokume). It is **read-only by
+script it was the first time (2026-08-28, on one workspace). It is **read-only by
 construction**: it calls `find_orphans`, never `sweep_table`, so no value of
 `ORPHAN_SWEEP_MODE` — including `delete` — can make it remove anything.
 

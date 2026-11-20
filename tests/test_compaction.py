@@ -9,18 +9,36 @@ rather than after a full rewrite.
 The warehouse fixture and the config factory live in conftest.py.
 """
 
+from functools import partial
+from types import SimpleNamespace
+
 import pytest
 import requests
-from conftest import FILES, ROWS_PER_FILE
+from conftest import (
+    FILES,
+    ROWS_PER_FILE,
+    append_rows,
+    commit_delete_file,
+    replace_rows,
+)
 from pyiceberg.exceptions import (
     CommitFailedException,
     CommitStateUnknownException,
     ValidationException,
 )
+from pyiceberg.expressions import AlwaysTrue
+from pyiceberg.manifest import (
+    DataFileContent,
+    ManifestContent,
+    ManifestFile,
+)
 from pyiceberg.table import TableProperties
 
 from iceberg_maintenance.maintenance import (
     compact_table,
+    delete_files_reason,
+    maintain_warehouse,
+    run_operation,
     stream_batches,
     unrewritable_manifest_reason,
 )
@@ -155,8 +173,8 @@ def test_unrewritable_manifest_is_skipped_before_anything_is_written(
     "not_a_candidate",
     [
         # Every file is above the small-file threshold, so none of them counts
-        # toward min_input_files: fokume's staging.stg_trips / marts.fct_trips
-        # after SMALL_FILE_MAX_BYTES dropped to 8 MiB on 2026-08-27.
+        # toward min_input_files: one workspace's two affected tables after
+        # SMALL_FILE_MAX_BYTES dropped to 8 MiB on 2026-08-27.
         pytest.param({"small_file_max_bytes": 1}, id="below-min-input-files"),
         # Small files are a sliver of a big table — the write-amplification gate.
         pytest.param({"rewrite_min_small_fraction": 1.1}, id="below-small-fraction"),
@@ -374,3 +392,272 @@ def test_a_concurrent_write_during_the_retry_is_not_clobbered(table, cfg, monkey
 
     table.refresh()
     assert 999_999 in _rows(table)["id"]
+
+
+def _assert_left_untouched(tbl, cfg):
+    head = tbl.current_snapshot().snapshot_id
+    files = _data_files(tbl)
+
+    outcome = compact_table(tbl, tbl.io, cfg())
+
+    assert outcome.kind == "unsupported", outcome
+    assert outcome.message.startswith("SKIPPED: has delete files"), outcome
+    tbl.refresh()
+    assert tbl.current_snapshot().snapshot_id == head
+    assert _data_files(tbl) == files
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        # DuckDB 1.5.3/1.5.4: the key is simply not there.
+        pytest.param(None, id="summary-silent"),
+        # A later writer counting on from a summary that had no total.
+        pytest.param({"total-delete-files": "0"}, id="summary-says-zero"),
+    ],
+)
+def test_unmatched_delete_files_are_skipped(evolved, cfg, summary):
+    """The regression guard for compaction bringing deleted rows back.
+
+    Both signals the job used to rely on say "no deletes" here: the summary
+    carries no count and PyIceberg's scan matches the delete file to nothing.
+    The rewrite then read the data files without the deletes and committed
+    them, while still reporting "compacted".
+    """
+    commit_delete_file(evolved, summary=summary)
+    assert not any(task.delete_files for task in evolved.scan().plan_files())
+
+    _assert_left_untouched(evolved, cfg)
+
+
+def test_delete_files_are_reported_even_when_not_a_candidate(evolved, cfg):
+    """`unsupported` is a property of the table, not of tonight's size gates."""
+    commit_delete_file(evolved)
+
+    outcome = compact_table(evolved, evolved.io, cfg(min_input_files=FILES + 1))
+
+    assert outcome.kind == "unsupported", outcome
+
+
+def test_a_delete_manifest_counts_even_if_every_entry_was_removed(evolved, cfg):
+    commit_delete_file(evolved, removed=True)
+
+    _assert_left_untouched(evolved, cfg)
+
+
+def test_a_data_typed_entry_in_a_delete_manifest_counts(evolved, cfg):
+    """The manifest's label is evidence by itself, whatever its entries claim."""
+    commit_delete_file(evolved, entry_content=DataFileContent.DATA)
+
+    _assert_left_untouched(evolved, cfg)
+
+
+def test_a_delete_entry_in_a_data_manifest_counts(evolved, cfg):
+    """A DATA label on the manifest does not vouch for its entries."""
+    commit_delete_file(evolved, manifest_content=ManifestContent.DATA)
+
+    _assert_left_untouched(evolved, cfg)
+
+
+def test_a_removed_delete_entry_in_a_data_manifest_counts(evolved, cfg):
+    """Only reading removed entries too can see this one."""
+    commit_delete_file(evolved, manifest_content=ManifestContent.DATA, removed=True)
+
+    _assert_left_untouched(evolved, cfg)
+
+
+def test_dead_deletes_do_not_block_compaction_and_rows_survive_it(evolved, cfg):
+    """After a truncate or replace, deletes carried forward can reach nothing.
+
+    Counts the rows through a real rewrite: nothing is lost, and the deletes
+    (aimed at files long gone) take nothing from the rows the replace wrote.
+    """
+    commit_delete_file(evolved, 3, summary={"total-delete-files": "1"})
+    replace_rows(evolved, list(range(1000, 1007)))
+    for k in range(5):
+        append_rows(evolved, [2000 + k])
+    expected = sorted([*range(1000, 1007), *range(2000, 2005)])
+    # The truncate left the summary's count standing. It is stale, not evidence.
+    assert int(evolved.current_snapshot().summary["total-delete-files"]) > 0
+
+    outcome = compact_table(evolved, evolved.io, cfg())
+
+    assert outcome.kind == "compacted", outcome
+    evolved.refresh()
+    assert sorted(evolved.scan().to_arrow().column("id").to_pylist()) == expected
+    assert sum(task.file.record_count for task in evolved.scan().plan_files()) == 12
+
+
+def test_one_data_file_older_than_the_deletes_still_blocks(evolved, cfg):
+    """A partial drop: the older files the deletes apply to are still live."""
+    commit_delete_file(evolved)
+    evolved.delete(delete_filter="id == 0")
+    evolved.refresh()
+
+    _assert_left_untouched(evolved, cfg)
+
+
+def _with_sequence(monkeypatch, sequence_of):
+    """Rewrite the data sequence number PyIceberg resolved for each entry."""
+    original = ManifestFile.fetch_manifest_entry
+
+    def patched(self, io, discard_deleted=True):
+        entries = original(self, io, discard_deleted)
+        for entry in entries:
+            entry.sequence_number = sequence_of(entry)
+        return entries
+
+    monkeypatch.setattr(ManifestFile, "fetch_manifest_entry", patched)
+
+
+def test_a_data_file_at_the_same_sequence_as_a_delete_blocks(evolved, cfg, monkeypatch):
+    """Position deletes apply at <=. DuckDB's UPDATE writes both in one commit."""
+    commit_delete_file(evolved)
+    replace_rows(evolved, [1, 2, 3])
+    newest_data = max(
+        entry.sequence_number
+        for manifest in evolved.current_snapshot().manifests(evolved.io)
+        if manifest.content == ManifestContent.DATA
+        for entry in manifest.fetch_manifest_entry(evolved.io)
+    )
+    _with_sequence(monkeypatch, lambda entry: newest_data)
+
+    _assert_left_untouched(evolved, cfg)
+
+
+@pytest.mark.parametrize("unresolved", ["data", "delete"])
+def test_an_unresolved_sequence_number_blocks(evolved, cfg, monkeypatch, unresolved):
+    commit_delete_file(evolved)
+    replace_rows(evolved, [1, 2, 3])
+    data = unresolved == "data"
+    _with_sequence(
+        monkeypatch,
+        lambda entry: (
+            None
+            if (entry.data_file.content == DataFileContent.DATA) == data
+            else entry.sequence_number
+        ),
+    )
+
+    assert delete_files_reason(evolved, evolved.current_snapshot())
+
+
+def test_a_live_path_named_by_an_old_delete_still_blocks(evolved, cfg):
+    """DELETE, truncate, then the same files re-added under a new sequence number.
+
+    Every data file is newer than the delete, so the spec says it cannot apply.
+    DuckDB applies it by path anyway, so a rewrite would move DuckDB's row count.
+    """
+    paths = _data_files(evolved)
+    commit_delete_file(evolved, 3)
+    evolved.delete(delete_filter=AlwaysTrue())
+    evolved.refresh()
+    evolved.add_files(paths)
+    evolved.refresh()
+
+    _assert_left_untouched(evolved, cfg)
+
+
+def test_a_live_path_spelled_differently_by_an_old_delete_still_blocks(evolved, cfg):
+    """The path check compares objects, not strings: a scheme is not a new file."""
+    paths = _data_files(evolved)
+    commit_delete_file(
+        evolved,
+        3,
+        spell=lambda path: path if path.startswith("file:") else f"file://{path}",
+    )
+    evolved.delete(delete_filter=AlwaysTrue())
+    evolved.refresh()
+    evolved.add_files(paths)
+    evolved.refresh()
+
+    _assert_left_untouched(evolved, cfg)
+
+
+def test_an_unreadable_delete_file_fails_rather_than_exempts(evolved, cfg):
+    commit_delete_file(evolved)
+    deletes = [
+        entry.data_file.file_path
+        for manifest in evolved.current_snapshot().manifests(evolved.io)
+        if manifest.content == ManifestContent.DELETES
+        for entry in manifest.fetch_manifest_entry(evolved.io)
+    ]
+    replace_rows(evolved, [1, 2, 3])
+    evolved.io.delete(deletes[0])
+    head = evolved.current_snapshot().snapshot_id
+
+    outcome = run_operation(
+        "t", "compact", "compaction", partial(compact_table, evolved, evolved.io, cfg())
+    )
+
+    assert outcome.kind == "failed", outcome
+    evolved.refresh()
+    assert evolved.current_snapshot().snapshot_id == head
+
+
+def test_dead_equality_deletes_still_block(evolved, cfg):
+    """PyIceberg's plan raises on them, so exempting one is a nightly `failed`."""
+    commit_delete_file(evolved, content=DataFileContent.EQUALITY_DELETES)
+    replace_rows(evolved, [1, 2, 3])
+
+    assert delete_files_reason(evolved, evolved.current_snapshot())
+
+
+def test_dead_deletes_on_a_v3_table_still_block(evolved):
+    """The swap cannot commit v3, so exempting one is a rewrite that always fails."""
+    commit_delete_file(evolved)
+    replace_rows(evolved, [1, 2, 3])
+    v3 = SimpleNamespace(
+        metadata=SimpleNamespace(format_version=3), io=evolved.io, name=evolved.name
+    )
+
+    assert delete_files_reason(v3, evolved.current_snapshot())
+
+
+def test_an_emptied_table_with_dead_deletes_has_no_delete_reason(evolved):
+    commit_delete_file(evolved)
+    evolved.delete(delete_filter=AlwaysTrue())
+    evolved.refresh()
+
+    assert delete_files_reason(evolved, evolved.current_snapshot()) is None
+
+
+def test_unreadable_manifests_fail_and_write_nothing(table, cfg, monkeypatch):
+    """A read error is a fault, not a property of the table: never a skip."""
+
+    def unreadable(self, io, discard_deleted=True):
+        raise OSError("connection reset")
+
+    monkeypatch.setattr(ManifestFile, "fetch_manifest_entry", unreadable)
+
+    head = table.current_snapshot().snapshot_id
+    outcome = run_operation(
+        "t", "compact", "compaction", partial(compact_table, table, table.io, cfg())
+    )
+
+    assert outcome.kind == "failed", outcome
+    table.refresh()
+    assert table.current_snapshot().snapshot_id == head
+
+
+def test_delete_files_are_counted_as_unsupported_and_named(evolved, cfg, warehouse):
+    commit_delete_file(evolved)
+
+    summary = maintain_warehouse(warehouse, evolved.io, cfg())
+
+    assert (summary.errors, summary.unsupported_tables) == (0, ["ns.evolved"])
+
+
+def test_a_table_without_delete_files_has_no_delete_reason(table):
+    assert delete_files_reason(table, table.current_snapshot()) is None
+
+
+def test_an_evolved_table_without_delete_files_still_compacts(evolved, cfg):
+    """The guard is about deletes, not about partition evolution."""
+    before = _rows(evolved)
+
+    outcome = compact_table(evolved, evolved.io, cfg())
+
+    assert outcome.kind == "compacted", outcome
+    evolved.refresh()
+    assert _rows(evolved) == before

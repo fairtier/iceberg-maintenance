@@ -51,6 +51,8 @@ src/iceberg_maintenance/
   orphans.py        # orphan-file sweep — the only code here that DELETES
   verify.py         # read-only pre-arming proof (python -m iceberg_maintenance.verify)
   telemetry.py      # OpenTelemetry setup + the instruments maintenance.py uses
+scripts/
+  detect_delete_exposure.py  # read-only: may an old image have undone deletes? Not in the image
 tests/              # pytest suite (conftest.py holds the local-warehouse fixture)
 ```
 
@@ -132,8 +134,15 @@ Rules that keep it honest:
   normal and must not page. On a state-unknown 5xx it re-reads the table
   before believing the commit failed.
 - **Safe skips, checked before any write.** Tables with delete files
-  (merge-on-read) and tables whose manifest entries PyIceberg mis-decodes
-  (DuckDB's Iceberg writer — `status` holds the snapshot id, `sequence_number`
+  (merge-on-read, decided by `delete_files_reason` from the manifests' own
+  content, never from the summary's `total-delete-files` or PyIceberg's
+  `task.delete_files`, both of which miss real deletes;
+  `test_unmatched_delete_files_are_skipped`. Only dead deletes are exempt: v2,
+  no equality deletes, every data file's sequence number above every delete's,
+  all of them resolved, and no live position delete naming a live data file,
+  because DuckDB applies those by path. A read error stays `failed`, never a
+  skip) and tables whose manifest entries
+  PyIceberg mis-decodes (DuckDB's Iceberg writer — `status` holds the snapshot id, `sequence_number`
   is null, so the swap's delete manifest is rejected at commit) are skipped for
   compaction but still get (metadata-only) snapshot expiry. Both gates run
   *before* the rewrite: a skip discovered at commit time costs a full

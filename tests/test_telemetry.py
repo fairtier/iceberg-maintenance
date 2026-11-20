@@ -30,6 +30,7 @@ def test_a_compaction_is_traced_end_to_end(table, cfg, spans):
     recorded = spans()
     assert set(recorded) == {
         "iceberg.compact",
+        "iceberg.compact.check_deletes",
         "iceberg.compact.plan",
         "iceberg.compact.check_manifests",
         "iceberg.compact.rewrite",

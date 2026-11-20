@@ -24,10 +24,10 @@ plus the sentence a human reads — and the whole run is one trace when a
 collector is configured (see telemetry.py).
 
 Deliberately NOT handled here:
-  - tables with delete files (DuckFlight/DuckDB writes are merge-on-read) —
-    a COW rewrite through PyIceberg's scan would need delete-file semantics
-    PyIceberg only partially applies, so those tables are skipped loudly
-    (snapshot expiry still runs — it never touches data files);
+  - tables with delete files that may still apply (DuckFlight/DuckDB writes are
+    merge-on-read) — the rewrite reads data files without applying deletes, so
+    those tables are skipped loudly, see delete_files_reason for the one
+    exemption (snapshot expiry still runs — it never touches data files);
   - tables whose manifests PyIceberg cannot decode faithfully (DuckDB's
     Iceberg writer) — skipped loudly for the same reason, see
     unrewritable_manifest_reason.
@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from functools import partial
 
 import pyarrow
+import pyarrow.parquet as pq
 import requests
 from opentelemetry.trace import Span, StatusCode
 from pyiceberg.catalog import load_catalog
@@ -74,7 +75,12 @@ from pyiceberg.io.pyarrow import (
     _dataframe_to_data_files,
     schema_to_pyarrow,
 )
-from pyiceberg.manifest import ManifestContent, ManifestEntryStatus
+from pyiceberg.manifest import (
+    DataFileContent,
+    FileFormat,
+    ManifestContent,
+    ManifestEntryStatus,
+)
 
 from . import orphans, telemetry
 from .config import MIB, Config, load_config
@@ -99,8 +105,8 @@ class Outcome:
       healthy      nothing to do — too few small files to bother
       skipped      compaction declined this table for now (write amplification,
                    or a scan that surprised us by yielding no rows)
-      unsupported  compaction can never run here as things stand: delete files,
-                   or manifests PyIceberg cannot decode
+      unsupported  compaction can never run here as things stand: delete files
+                   that may still apply, or manifests PyIceberg cannot decode
       empty        no snapshot at all
       expired      snapshots were expired
       nothing      expiry had nothing outside the window and floor
@@ -194,8 +200,9 @@ def stream_batches(scan, tasks):
     only advances when we ask for the next batch.
 
     Passing `deletes_per_file={}` is correct, not a shortcut: `compact_table`
-    returns early for any table that has delete files, so there are none to
-    apply here.
+    rewrites a table only if `delete_files_reason` found no delete files, or only
+    ones that cannot remove a row of any data file read here (older than every
+    data file, and none of them aimed at a live path), so there are none to apply.
     """
     arrow_scan = ArrowScan(
         scan.table_metadata,
@@ -215,6 +222,114 @@ def stream_batches(scan, tasks):
         target_schema
     )
     yield from reader
+
+
+def _aimed_at_live_data(table, live_deletes, live_paths) -> bool:
+    """Whether a position delete could name a live data file, read from the files.
+
+    True for anything that isn't parquet position deletes, which this cannot read.
+    Streamed by batch, so a large delete file costs no more than one batch.
+    """
+    live = {orphans.normalize(table.io, path) for path in live_paths}
+    for delete_file in live_deletes:
+        if (
+            delete_file.content != DataFileContent.POSITION_DELETES
+            or delete_file.file_format != FileFormat.PARQUET
+        ):
+            return True
+        with table.io.new_input(delete_file.file_path).open() as stream:
+            parquet = pq.ParquetFile(stream)
+            for batch in parquet.iter_batches(columns=["file_path"]):
+                for path in batch.column(0).unique().to_pylist():
+                    if orphans.normalize(table.io, path) in live:
+                        return True
+    return False
+
+
+def delete_files_reason(table, snapshot) -> str | None:
+    """Why this snapshot's delete files make a rewrite unsafe, or None if they don't.
+
+    The rewrite reads data files without applying deletes, so any delete that
+    still applies comes back as a live row. Read from the manifests themselves,
+    because neither shortcut can be trusted with that:
+
+    - The snapshot summary's `total-delete-files` is optional. DuckDB's iceberg
+      extension at 1.5.3/1.5.4 (the dbt path) never writes it, and later writers
+      count on from the previous summary, so one such commit anywhere in the
+      history leaves it absent or zero. It also errs the other way: a truncate
+      carries a stale positive count forward.
+    - `task.delete_files` is PyIceberg's matching, not the table's truth. On a
+      partition-evolved table DuckDB 1.5.x files a delete under the current
+      spec while its data file stays under the old one: Record[0] under spec 2
+      beside Record[0] under spec 1, or once data exists under the new spec too,
+      Record[0, None]. Spec id or tuple differs, so it matches nothing and a
+      table full of deletes plans with none.
+
+    Any manifest not plainly DATA counts, as does a delete-typed entry inside a
+    DATA manifest, and removed entries count too.
+
+    The one exemption is deletes that can no longer apply to anything, which is
+    what a truncate or a replace leaves behind, since their manifests are carried
+    forward. The spec applies position deletes and deletion vectors to data files
+    with a data sequence number <= the delete's, and equality deletes to those
+    strictly less, so a data file newer than every delete is out of reach of all
+    of them, for readers that follow the spec. DuckDB doesn't here: it applies a
+    position delete by path whatever the sequence numbers, so re-adding a file
+    (`add_files`) brings its old deletes back into force for DuckDB alone. So
+    exempt only if all of this holds: a format v2 table (the swap cannot commit
+    v3, so rewriting one just fails after the work), no equality deletes
+    (PyIceberg's plan raises on them), every sequence number resolved, and every
+    live delete a parquet position delete aimed at no live data path. Anything
+    else is a skip. The delete files are read only for a table that passed the
+    rest, which would otherwise be exempt.
+
+    Read errors deliberately propagate: `run_operation` records them as `failed`,
+    the run exits non-zero, and nothing has been written.
+    """
+    reason = None
+    delete_sequences: list[int | None] = []
+    data_sequences: list[int | None] = []
+    live_deletes = []
+    live_paths = set()
+    exemptable = table.metadata.format_version == 2
+    for manifest in snapshot.manifests(io=table.io):
+        name = manifest.manifest_path.rsplit("/", 1)[-1]
+        is_delete_manifest = manifest.content != ManifestContent.DATA
+        if is_delete_manifest:
+            reason = reason or f"manifest {name}"
+            delete_sequences.append(manifest.sequence_number)
+        for entry in manifest.fetch_manifest_entry(io=table.io, discard_deleted=False):
+            content = entry.data_file.content
+            if is_delete_manifest or content != DataFileContent.DATA:
+                reason = reason or f"entry in {name}"
+                delete_sequences.append(entry.sequence_number)
+                exemptable = exemptable and content != DataFileContent.EQUALITY_DELETES
+                if entry.status != ManifestEntryStatus.DELETED:
+                    live_deletes.append(entry.data_file)
+            elif not isinstance(entry.status, ManifestEntryStatus):
+                data_sequences.append(None)
+            elif entry.status != ManifestEntryStatus.DELETED:
+                data_sequences.append(entry.sequence_number)
+                live_paths.add(entry.data_file.file_path)
+    if reason is None:
+        return None
+    sequences = [*delete_sequences, *data_sequences]
+    if (
+        exemptable
+        and all(sequence is not None for sequence in sequences)
+        and (
+            not data_sequences
+            or min(s for s in data_sequences if s is not None)
+            > max(s for s in delete_sequences if s is not None)
+        )
+        and not _aimed_at_live_data(table, live_deletes, live_paths)
+    ):
+        log.info(
+            "%s: delete files are older than every data file and aim at none",
+            ".".join(table.name()),
+        )
+        return None
+    return f"has delete files (merge-on-read writes, {reason})"
 
 
 def unrewritable_manifest_reason(table, snapshot) -> str | None:
@@ -425,27 +540,24 @@ def _compact_table(span: Span, table, s3_io, cfg: Config) -> Outcome:
     if snapshot is None:
         return Outcome("empty", "empty (no snapshot)")
 
-    # Merge-on-read delete files (DuckFlight UPDATE/DELETE/MERGE) make a
-    # naive COW rewrite unsafe — skip and say so.
-    summary = snapshot.summary or {}
-    if int(summary.get("total-delete-files", 0) or 0) > 0:
+    table.io = s3_io
+
+    # Merge-on-read delete files (DuckFlight UPDATE/DELETE/MERGE) make a naive
+    # COW rewrite unsafe: stream_batches reads the data files without them, so
+    # every deleted row comes back. Skip and say so.
+    with tracer.start_as_current_span("iceberg.compact.check_deletes"):
+        reason = delete_files_reason(table, snapshot)
+    if reason:
         return Outcome(
             "unsupported",
-            "SKIPPED: has delete files (merge-on-read writes) — compaction not supported yet",
+            f"SKIPPED: {reason} — compaction not supported yet, table left untouched",
         )
-
-    table.io = s3_io
 
     # One scan object for both the plan and the read below — planning twice
     # would re-fetch the manifests for nothing.
     with tracer.start_as_current_span("iceberg.compact.plan"):
         scan = table.scan()
         tasks = list(scan.plan_files())
-    if any(task.delete_files for task in tasks):
-        return Outcome(
-            "unsupported",
-            "SKIPPED: has delete files (merge-on-read writes) — compaction not supported yet",
-        )
 
     sizes = [task.file.file_size_in_bytes for task in tasks]
     total = sum(sizes)
@@ -473,18 +585,17 @@ def _compact_table(span: Span, table, s3_io, cfg: Config) -> Outcome:
     # to tables that were already compaction candidates, so `unsupported`
     # quietly meant "un-compactable AND currently a candidate", and tuning a
     # gate moved a signal that has nothing to do with tuning. It did: lowering
-    # SMALL_FILE_MAX_BYTES 32 MiB -> 8 MiB on 2026-08-27 took fokume's
+    # SMALL_FILE_MAX_BYTES 32 MiB -> 8 MiB on 2026-08-27 took one workspace's
     # iceberg_maintenance_tables_unsupported from 2 to 0 without repairing
-    # anything, because staging.stg_trips and marts.fct_trips (~8.5 MiB/file)
+    # anything, because its two affected tables (~8.5 MiB/file)
     # stopped clearing min_input_files and returned "healthy" one gate earlier.
     # BoxIcebergTablesUnsupported would have resolved on a box where the
     # interop bug was untouched — the same "a skipped table counts as a clean
     # run" silence that RunSummary.unsupported exists to end.
     #
-    # It costs a manifest-entry read on every table, but not a new one:
-    # plan_files above already fetched every data manifest's entries to build
-    # `tasks`; this re-reads the same avro for the entry-header halves the plan
-    # discards. The file counts ride along in the message because they are what
+    # It costs a manifest-entry read on every table, on top of the ones
+    # delete_files_reason and plan_files above already did: this re-reads the
+    # same avro for the entry-header halves the plan discards. The file counts ride along in the message because they are what
     # says whether this table is merely un-compactable or actively rotting.
     with tracer.start_as_current_span("iceberg.compact.check_manifests"):
         reason = unrewritable_manifest_reason(table, snapshot)
@@ -942,8 +1053,8 @@ def write_textfile(path: str, summary: RunSummary, cfg: Config) -> None:
         "# TYPE iceberg_maintenance_tables_scanned gauge\n"
         f"iceberg_maintenance_tables_scanned {summary.tables}\n"
         "# HELP iceberg_maintenance_tables_unsupported Tables the last clean run "
-        "could not compact at all (delete files, or manifests PyIceberg cannot "
-        "decode). Snapshot expiry still runs on them.\n"
+        "could not compact at all (delete files that may still apply, or "
+        "manifests PyIceberg cannot decode). Snapshot expiry still runs on them.\n"
         "# TYPE iceberg_maintenance_tables_unsupported gauge\n"
         f"iceberg_maintenance_tables_unsupported {summary.unsupported}\n"
         "# HELP iceberg_maintenance_orphan_files Files under the warehouse's "

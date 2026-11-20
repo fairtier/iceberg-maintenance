@@ -139,7 +139,36 @@ armed run.
 
 - **Tables with delete files** (DuckFlight/DuckDB merge-on-read writes) — a
   copy-on-write rewrite isn't safe for them, so compaction skips them loudly.
-  Snapshot expiry still runs (it never touches data files).
+  Snapshot expiry still runs (it never touches data files). "Has delete files"
+  is read from the current snapshot's manifests: the summary's
+  `total-delete-files` is absent on tables DuckDB 1.5.3/1.5.4 wrote, and
+  PyIceberg's scan does not match DuckDB 1.5.x deletes to data files on a
+  partition-evolved table. Trusting either let a rewrite bring deleted rows
+  back. The exception is delete files no data file can be affected by, which a
+  truncate or replace carries forward: a v2 table with no equality deletes,
+  whose every data file has a higher sequence number than every delete, and
+  whose live position deletes name no live data file, still compacts. A manifest that cannot be read fails the table (`failed`, non-zero
+  exit, no heartbeat) with nothing written.
+
+  `scripts/detect_delete_exposure.py` is the read-only check for what older
+  images did: it reports per table whether a rewrite may already have undone
+  deletes, unconfirmed, or still would. It is not in the image; its docstring has
+  the verdicts and how to run it.
+
+  **Rollout — known limits.** This image stops new damage; it does not detect
+  old damage. A table an older image already rewrote has its deletes dead, so
+  it compacts normally, stays out of `tables_unsupported`, and nothing alerts.
+  And the nightly expiry (`MAX_SNAPSHOT_AGE_MS`, 7 days by default) removes its
+  pre-rewrite snapshot, the only recovery point. So run the script on each box
+  *before* deploying this image, and keep the JSON (`--json`). For any table flagged `SUSPECTED_DAMAGE` or `NEEDS_HUMAN_CHECK`, raise
+  `MAX_SNAPSHOT_AGE_MS` on that box until someone has decided. A snapshot is
+  expired only when it is older than that and outside the newest
+  `MIN_SNAPSHOTS_TO_KEEP`, so this holds the snapshot however many commits follow.
+  It applies to every table in the warehouse, it lengthens the customer-visible
+  time-travel window, and it cannot bring back a snapshot already expired. The
+  chart value is `expiry.maxSnapshotAgeMs`, which the root chart has no per-box
+  parameter for, and the box's Application self-heals, so a per-box override needs
+  one added first.
 - **Tables whose manifests PyIceberg can't decode** — on tables written by
   DuckDB's Iceberg writer, PyIceberg reads the manifest *entry header* wrong:
   `status` comes back holding the snapshot id and `sequence_number` is `None`
@@ -260,8 +289,8 @@ Three things about it are deliberate:
   not mounted; the staleness alert covers a heartbeat that stops arriving.
 
 `tables_unsupported` is the one worth wiring an alert to. It counts tables
-compaction can never run on as things stand — delete files, or manifests
-PyIceberg cannot decode — as distinct from the `skipped` outcome, which is the
+compaction can never run on as things stand — delete files that may still
+apply, or manifests PyIceberg cannot decode — as distinct from the `skipped` outcome, which is the
 write-amplification gate declining a healthy table and is normal every night.
 Because the manifest check runs ahead of the size gates, the number answers
 "how much of this warehouse can compaction never repair", not "how much of it
@@ -289,7 +318,8 @@ iceberg.maintenance.run
 └── iceberg.maintenance.table                  iceberg.table, iceberg.namespace
     ├── iceberg.catalog.load_table
     ├── iceberg.compact                        iceberg.outcome + the input/small
-    │   ├── iceberg.compact.plan                 file counts every gate decided on
+    │   ├── iceberg.compact.check_deletes        file counts every gate decided on
+    │   ├── iceberg.compact.plan
     │   ├── iceberg.compact.check_manifests
     │   ├── iceberg.compact.rewrite            one "chunk written" event per flush
     │   └── iceberg.compact.commit               (rows, bytes, files so far)
